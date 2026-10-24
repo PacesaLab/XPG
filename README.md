@@ -5,6 +5,8 @@ indexing, integration, symmetry, scaling and merging on the GPU, and logs every 
 it. It runs on NVIDIA, AMD and Intel GPUs, on Apple silicon, or on the CPU, and needs no other crystallographic
 software.
 
+https://github.com/user-attachments/assets/1729523e-c3cc-421e-9505-a4be930f7b00
+
 ## Installation
 
 ```bash
@@ -51,6 +53,9 @@ or CCD codes). Everything is predicted together as one complex. If you give a mo
 
 All settings, outputs and things to look out for are in the [guide](docs/GUIDE.md). The input and output files
 are described in [FORMAT](docs/FORMAT.md).
+
+https://github.com/user-attachments/assets/dcce2021-bfa2-46aa-983d-8ae64aff17d3
+
 
 ## References
 
