@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xpg"
+version = "0.2.0"
+description = "GPU-accelerated (PyTorch) rotation-data processing for macromolecular crystallography"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["torch>=2.4", "numpy", "scipy>=1.15", "gemmi>=0.7", "h5py", "hdf5plugin", "lz4", "matplotlib"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+xpg = "xpg.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["xpg*"]
