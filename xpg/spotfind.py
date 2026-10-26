@@ -146,10 +146,11 @@ def find_spots(images, frames, gain=1.0, mask=None, strong_pixel=3.0, background
         q = ctx.Queue()
         conn, child_conn = ctx.Pipe(duplex=False)
         ncl = _cluster_procs(dev)
+        nclustered = ctx.RawValue("q", 0)                  # frames clustered so far (progress)
         # a daemonic process cannot start the block-clustering workers; the frame loop terminates it on any error
         proc = ctx.Process(target=_cluster_child, args=(q, child_conn, (images.nx, images.ny, min_pixels, max_pixels,
                                                                       max_centroid_dist, cluster_radius), ncl),
-                           daemon=ncl == 1)
+                           kwargs=dict(progress=nclustered), daemon=ncl == 1)
         # the child needs nothing of the calling script: with its path / module name hidden, spawn does not run it
         # again in the child (a script without an `if __name__ == "__main__":` guard would start the whole pipeline
         # there, writing into the same run directory)
@@ -168,11 +169,15 @@ def find_spots(images, frames, gain=1.0, mask=None, strong_pixel=3.0, background
         child_conn.close()
     cluster = ThreadPoolExecutor(1) if proc is None else None
     jobs = []
-    state = dict(prev=None, nstrong=0)
+    state = dict(prev=None, nstrong=0, nclustered=0)
     ready, pending = False, []
 
     def cluster_batch(*batch):
         _cluster_batch(acc, state, *batch)
+        state["nclustered"] += len(batch[0])
+
+    def clustered():
+        return nclustered.value if proc is not None else state["nclustered"]
 
     def child_started(wait=False):
         """True once the clustering process runs. If it dies before (spawn re-imports the calling script, which fails
@@ -248,15 +253,28 @@ def find_spots(images, frames, gain=1.0, mask=None, strong_pixel=3.0, background
                 batch_frames = []
             if verbose and (i + 1) % 200 == 0:
                 log(f"  SPOTS: {i + 1}/{len(frames)} frames, {state['nstrong']} strong pixels, "
-                    f"{(i + 1) / (time.time() - t0):.1f} frames/s")
+                    f"{(i + 1) / (time.time() - t0):.1f} frames/s, {clustered()} frames clustered")
         if batch_frames:
             process(batch_frames)
+        t_read = time.time()
+
+        def wait(finished):
+            # the clustering can fall behind the frames (an ice ring or a streak is one cluster over many frames):
+            # say how far it is instead of waiting silently
+            while not finished(60.0):
+                if verbose:
+                    log(f"  SPOTS: clustering, {clustered()}/{len(frames)} frames "
+                        f"({time.time() - t_read:.0f}s after the last frame)")
         if proc is not None:
             child_started(wait=True)
+        if proc is None:
+            from concurrent.futures import wait as wait_futures
+            wait(lambda t: not wait_futures(jobs, timeout=t).not_done)
         for j in jobs:
             j.result()
         if proc is not None:
             q.put(None)
+            wait(conn.poll)
             status, payload = conn.recv()
             proc.join()
             if status != "ok":

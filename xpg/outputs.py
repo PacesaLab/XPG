@@ -56,7 +56,7 @@ def write_merged_outputs(merged, cell, sg, dcut, wavelength, stem: Path, log=pri
         cols_a = cols + [("FANISO", "F", "F_aniso"), ("SIGFANISO", "Q", "SIGF_aniso"),
                          ("IPOST", "J", "Ipost"), ("SIGIPOST", "Q", "SIGIpost")]
         write_merged_mtz(f"{stem}_anisotropic.mtz", sg, cell, wavelength, ma, cols_a,
-                         history=["XPG anisotropic cut-off (local <I/sigI> >= 1.2)",
+                         history=["XPG anisotropic cut-off (<I/sigI> >= 1.2 along each direction)",
                                   f"principal limits {surf.limits.round(2).tolist()}"])
         return dict(limits=surf.limits.tolist(), directions_hkl=surf.directions_hkl.tolist(),
                     B_eigen=model.eigen_B.tolist(), n_inside=int(ins.sum()), inside_hkl=ma["hkl"])

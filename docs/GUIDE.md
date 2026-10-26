@@ -312,7 +312,7 @@ right-handed.
 | lattice tolerance, symmetry I/sigma limit | 2 deg, 6 |
 | outlier rejection, error model | 6 sigma; SdFac, SdB, SdAdd |
 | scale knots, absorption | 5 deg (scale), 20 deg (B), harmonics up to l = 6 |
-| anisotropic cut-off | local I/sigma >= 1.2 |
+| anisotropic cut-off | <I/sigma> >= 1.2 along each direction (ellipsoid fit) |
 | ΔCC1/2 outliers | < 0 or < mean - 3 sd (Assmann et al. 2016) |
 | tNCS | Patterson peak > 20% of the origin, > 15 Å |
 

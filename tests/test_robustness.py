@@ -112,3 +112,56 @@ def test_bitshuffled_frames_finished_on_device(tmp_path):
     ref = a.astype(np.float32)
     ref[a == 2 ** 16 - 1] = -1.0
     np.testing.assert_array_equal(img.numpy().reshape(ny, nx), ref)
+
+
+def test_streaming_clustering_equals_one_pass():
+    """Spots from the streaming accumulator (batches of frames, clusters still open carried over) are those of one
+    pass over all frames, also with a ring of strong pixels on every frame (one cluster that never closes)."""
+    from xpg.spotcluster import _Accumulator, _cluster_batch
+    nx = ny = 300
+    rng = np.random.default_rng(0)
+    frames = []
+    for f in range(40):
+        r2 = np.random.default_rng(f // 3)
+        c = r2.integers(10, nx - 10, (40, 2))
+        d = np.array([(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)])
+        p = (c[:, None, :] + d[None]).reshape(-1, 2)
+        th = rng.uniform(0, 2 * np.pi, 400)
+        ring = np.c_[150 + 100 * np.sin(th), 150 + 100 * np.cos(th)].astype(int)
+        k = np.unique(np.r_[p, ring] @ np.array([nx, 1]))
+        v = rng.uniform(20, 100, k.size).astype(np.float32)
+        frames.append((k // nx, k % nx, v, np.full(k.size, 5.0, np.float32)))
+
+    def run(batch):
+        acc, st = _Accumulator(nx, ny, 3, 10 ** 9), dict(prev=None)
+        for b0 in range(0, len(frames), batch):
+            fr = list(range(b0 + 1, min(b0 + batch, len(frames)) + 1))
+            kk = np.concatenate([np.full(frames[f - 1][0].size, i) for i, f in enumerate(fr)])
+            _cluster_batch(acc, st, fr, kk, *(np.concatenate([frames[f - 1][j] for f in fr]) for j in range(4)))
+        acc.flush()
+        s = acc.result()
+        return np.sort(np.c_[s.x, s.y, s.z, s.intensity, s.npix], axis=0)
+
+    one = run(len(frames))
+    assert len(one) > 100
+    for batch in (1, 3, 8):
+        assert np.array_equal(run(batch), one)
+
+
+def test_anisotropic_limits_recovered():
+    """The cut-off surface follows <I/sigma> = threshold along each principal direction (synthetic falloff with
+    known limits 1.8 / 2.2 / 2.6 A along a*, b*, c*)."""
+    from xpg.aniso import fit_cutoff_surface
+    cell = np.array([50.0, 60.0, 70.0, 90, 90, 90])
+    n = [int(cell[i] / 1.7) for i in range(3)]
+    h = np.array([(a, b, c) for a in range(0, n[0] + 1) for b in range(0, n[1] + 1) for c in range(0, n[2] + 1)])[1:]
+    s = h / cell[:3]
+    lim = np.array([1.8, 2.2, 2.6])
+    q = np.sqrt(((s * lim) ** 2).sum(1))              # 1 on the true surface
+    keep = np.linalg.norm(s, axis=1) <= 1 / 1.7
+    h, q = h[keep], q[keep]
+    isig = 1.2 * np.exp(-4.0 * (q - 1)) + np.random.default_rng(0).normal(0, 0.3, q.size)
+    surf = fit_cutoff_surface(h, isig, cell, "P 21 21 21")
+    assert np.allclose(np.sort(surf.limits), lim, atol=0.08), surf.limits
+    inside = surf.contains(h, cell)
+    assert inside[q < 0.95].mean() > 0.97 and inside[q > 1.05].mean() < 0.05

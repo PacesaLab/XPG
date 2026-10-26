@@ -60,7 +60,7 @@ def test_segment_and_distortion_roundtrip():
 
 
 def test_kernel_detector_matches_numpy():
-    import jax.numpy as jnp
+    from xpg import tnp as jnp
     from xpg.integrate_kernels import _detector_consts, _pixel_S
     th = np.radians(0.4)
     segs = [Segment(1, 2068, 1, 1000), Segment(1, 2068, 1040, 2162, orgx=0.4, distance=0.2,
@@ -379,11 +379,14 @@ def test_fractional_twin_law_matrix():
 
 def test_symmetry_decision_ncs_twin_systematic_error():
     """Point-group decision on synthetic data with known truth (tests/symsim.py): strong NCS pseudo-symmetry and a
-    near-perfect twin must not pass as symmetry; true symmetry with large systematic errors must not be rejected."""
+    near-perfect twin must not pass as symmetry, nor a true element as a twin law; true symmetry with large
+    systematic errors must not be rejected."""
     from symsim import CELL, decide, observations
     from xpg.simulate import SimSpec
     cases = [("3", dict(space_group="P 31", ncs_op="k,h,-l", ncs_c=0.45, ncs_b=10.0), {}),
              ("3", dict(space_group="P 31", twin_law="k,h,-l", twin_fraction=0.40), {}),
+             # twin law along c (apparent 6): <|L|> saturates near a perfect twin, the 3-fold must not be lost
+             ("3", dict(space_group="P 31", twin_law="-h,-k,l", twin_fraction=0.45), {}),
              ("32", dict(space_group="P 31 2 1"), dict(sys_err=0.25))]
     for truth, sk, ok in cases:
         h, I, sig, s, phi = observations(SimSpec(cell=CELL, structure_seed=1000, **sk), seed=0, **ok)

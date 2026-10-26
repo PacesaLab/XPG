@@ -6,7 +6,7 @@ anisotropic) B-factor, Lorentz/polarisation, a smooth phi-dependent scale and Po
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -53,11 +53,16 @@ class SimSpec:
     extra_lattice_scale: float = 0.6
     extra_lattice_sigma_m: float = 0.0  # > 0: the second crystal's reflecting range (deg; default: sigma_m)
     extra_lattice_sigma_d: float = 0.0  # > 0: its beam divergence / spot width (deg; default: sigma_d)
+    extra_lattice_noniso: float = 0.0   # > 0: the second crystal's intensities are this fraction of an unrelated
+                                        # structure's (non-isomorphous crystal; 0.5 -> CC ~0.7 to the first)
     sensor_material: str = "Si"
     mean_i0: float = 1.5e4          # mean counts at low resolution
     background: float = 2.0
     ring_d: float = 3.9             # resolution of a diffuse solvent ring
     ring_amp: float = 3.0
+    ice_powder: float = 0.0         # counts per pixel at the strongest hexagonal-ice powder ring (on every frame)
+    ice_spots: int = 0              # spots per frame from ice crystallites on the ice rings (spotty ice)
+    ice_spot_counts: float = 3000.0  # mean counts of an ice spot
     dmin: float = 1.6
     scale_decay: float = 0.25       # fractional loss over sweep
     gaps: bool = True
@@ -236,6 +241,9 @@ def simulate(outdir: str | Path, spec: SimSpec | None = None, write_images=True,
         A2 = rotation_matrix(ax, np.radians(spec.extra_lattice_rot)) @ Astar
         p2 = predict_reflections(geom, A2, spec.dmin, z_range=(-5.0, spec.nframes + 5.0))
         I2, h2 = true_intensities(spec, p2["hkl"], rng)
+        if spec.extra_lattice_noniso > 0:
+            other = replace(spec, structure_seed=(spec.seed if spec.structure_seed is None else spec.structure_seed) + 7919)
+            I2 = (1 - spec.extra_lattice_noniso) * I2 + spec.extra_lattice_noniso * true_intensities(other, p2["hkl"], rng)[0]
         p2["lattice"] = np.ones(len(I2), int)
         pred = {k: np.concatenate([pred[k], p2[k]]) for k in pred}
         I_true = np.concatenate([I_true, I2 * spec.extra_lattice_scale])
@@ -270,6 +278,16 @@ def simulate(outdir: str | Path, spec: SimSpec | None = None, write_images=True,
     bg = spec.background * (1.0 + 0.5 * np.exp(-((1 / dmap) / 0.25) ** 2)) \
         + spec.ring_amp * np.exp(-0.5 * ((1 / dmap - 1 / spec.ring_d) / 0.02) ** 2)
     zeta_px, pol_px = geom.lp_factor(geom.pixel_to_s(xs + PIX0, ys + PIX0))
+    if spec.ice_powder > 0:      # powder rings of hexagonal ice (relative intensities approximate)
+        from .ice import ICE_RINGS
+        w_ice = (1.0, 0.6, 0.8, 0.3, 0.4, 0.25, 0.05, 0.25, 0.15, 0.05)
+        bg = bg + spec.ice_powder * sum(w * np.exp(-0.5 * ((1 / dmap - 1 / d) / 0.0015) ** 2)
+                                        for d, w in zip(ICE_RINGS, w_ice))
+    if spec.ice_spots > 0:       # pixels on each ice ring, for the crystallite spots
+        from .ice import ICE_RINGS
+        ice_rng = np.random.default_rng(spec.seed + 4242)
+        ice_pix = [np.flatnonzero(np.abs(1 / dmap - 1 / d).ravel() < 0.001) for d in ICE_RINGS]
+        ice_pix = [a for a in ice_pix if a.size]
     bg = bg * pol_px
     mask = np.ones((spec.ny, spec.nx), bool)
     if geom.segmented:
@@ -354,6 +372,16 @@ def simulate(outdir: str | Path, spec: SimSpec | None = None, write_images=True,
             PX = np.broadcast_to(px[:, None, :], val.shape)
             ok = (PX >= 0) & (PX < spec.nx) & (PY >= 0) & (PY < spec.ny)
             np.add.at(img, (PY[ok], PX[ok]), val[ok])
+        if spec.ice_spots > 0 and ice_pix:    # crystallites: 2D Gaussian spots (sigma 1 px) on one frame each
+            ring = ice_rng.integers(0, len(ice_pix), spec.ice_spots)
+            at = np.array([ice_pix[r][ice_rng.integers(0, ice_pix[r].size)] for r in ring])
+            cy, cx = at // spec.nx, at % spec.nx
+            amp = ice_rng.exponential(spec.ice_spot_counts, at.size)
+            for dy in range(-3, 4):
+                for dx in range(-3, 4):
+                    yy, xx = cy + dy, cx + dx
+                    ok = (yy >= 0) & (yy < spec.ny) & (xx >= 0) & (xx < spec.nx)
+                    np.add.at(img, (yy[ok], xx[ok]), amp[ok] * np.exp(-0.5 * (dx * dx + dy * dy)) / (2 * np.pi))
         frame = rng.poisson(img).astype(np.int32)
         frame[~mask] = -1
         if eiger is not None:

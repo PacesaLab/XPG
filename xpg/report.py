@@ -135,7 +135,7 @@ def build_markdown(pipe) -> str:
             dd = np.asarray(d, float)
             dd = dd / np.max(np.abs(dd)) if np.max(np.abs(dd)) > 0 else dd
             parts.append(f"{lim:.2f} A along {' '.join(f'{x:+.2f}' for x in dd)}")
-        L += ["- Anisotropic diffraction limits (local <I/sigma> = 1.2): " + "; ".join(parts)]
+        L += ["- Anisotropic diffraction limits (<I/sigma> = 1.2 along each direction): " + "; ".join(parts)]
         try:
             from .aniso import ellipsoidal_completeness
             mg = r.get("merged")
@@ -171,14 +171,22 @@ def build_markdown(pipe) -> str:
             L += ["| " + name + " | " + " | ".join(fn(c) for c in cols) + " |"]
         if an and r.get("ellipsoidal_completeness") is not None:
             L += ["| Ellipsoidal completeness % | | | | " + _f(100 * r["ellipsoidal_completeness"], '.1f') + " | | |"]
-        L += ["", "All shells (to the detector edge):"]
-        L += ["", "| Resolution (A) | N obs | N uniq | Compl % | Mult | I/sigma | Rmeas | Rpim | CC1/2 | CCano |",
-              "|---|---|---|---|---|---|---|---|---|---|"]
-        for s in list(shells) + [ov]:
-            lab = f"{s.dmax:.2f}-{s.dmin:.2f}" if s is not ov else f"**overall {s.dmax:.2f}-{s.dmin:.2f}**"
-            L += [f"| {lab} | {int(s.n_obs)} | {int(s.n_uniq)} | {_f(100 * s.completeness if s.completeness <= 1.0 else s.completeness, '.1f')} | {_f(s.multiplicity, '.1f')} "
-                  f"| {_f(s.i_over_sigma, '.1f')} | {_f(s.rmeas, '.3f')} | {_f(s.rpim, '.3f')} | {_f(s.cc_half, '.3f')} "
-                  f"| {_f(s.cc_ano, '.3f')} |"]
+        # per shell: to the limit, as in xpg_merged_iso.mtz and the PDF, with the same overall row; the shells beyond
+        # it (in xpg_unmerged.mtz only) separately, without an overall row of their own
+        head_s = ["| Resolution (A) | N obs | N uniq | Compl % | Mult | I/sigma | Rmeas | Rpim | CC1/2 | CCano |",
+                  "|---|---|---|---|---|---|---|---|---|---|"]
+
+        def row(s, lab):
+            return (f"| {lab} | {int(s.n_obs)} | {int(s.n_uniq)} | {_f(100 * s.completeness if s.completeness <= 1.0 else s.completeness, '.1f')} | {_f(s.multiplicity, '.1f')} "
+                    f"| {_f(s.i_over_sigma, '.1f')} | {_f(s.rmeas, '.3f')} | {_f(s.rpim, '.3f')} | {_f(s.cc_half, '.3f')} "
+                    f"| {_f(s.cc_ano, '.3f')} |")
+        L += ["", "Shells " + ("to the CC1/2 = 0.3 limit (xpg_merged_iso.mtz):" if cut else "(all data):"), ""] + head_s
+        L += [row(s, f"{s.dmax:.2f}-{s.dmin:.2f}") for s in shells_s]
+        L += [row(ov_s, f"**overall {ov_s.dmax:.2f}-{ov_s.dmin:.2f}**")]
+        beyond = [s for s in shells if cut and 0.5 * (s.dmax + s.dmin) < ov_s.dmin]
+        if beyond:
+            L += ["", "Beyond the limit, to the detector edge (in xpg_unmerged.mtz only):", ""] + head_s
+            L += [row(s, f"{s.dmax:.2f}-{s.dmin:.2f}") for s in beyond]
 
     # files
     L += ["", "## Output files", ""]

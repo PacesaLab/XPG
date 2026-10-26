@@ -231,7 +231,7 @@ The refined experiment, written next to every unmerged MTZ so that the MTZ is al
 
 | File | Content |
 |---|---|
-| `xpg_summary.json` | space group and alternatives, cell, ISa, resolution limit, anisotropy, error model, the merging statistics (`statistics`: overall, inner and outer shell to the CC1/2 limit; `statistics_aniso`: the same inside the anisotropic surface, with the ellipsoidal completeness) and `pathologies` (`tncs`: Patterson peak ratio, vector, distance; `twinning`: L-test and every twin law with its H-test and Britton fractions; `hidden_twin`) |
+| `xpg_summary.json` | space group and alternatives, cell, ISa, resolution limit, anisotropy, error model, the merging statistics (`statistics`: overall, inner and outer shell to the CC1/2 limit, as in the reports; `statistics_aniso`: the same inside the anisotropic surface, with the ellipsoidal completeness; `overall`: all data to the detector edge, as in xpg_unmerged.mtz) and `pathologies` (`tncs`: Patterson peak ratio, vector, distance; `twinning`: L-test and every twin law with its H-test and Britton fractions; `hidden_twin`) |
 | `xpg_mr.json` | one entry per data set searched (space group, copies, tNCS pairs, TFZ, LLG, R and R-free of the placed model, the `pathologies` MR found and used, the twin fraction refined against the model) and `choice`, the data set and space group picked |
 | `events.jsonl` | one JSON object per line: `t` (time), `type` (`run_start`, `stage_start`, `stage_end`, `log`, `metric`, `decision`, `flag`, `run_end`) and `stage`; the dashboard and the PDF read it |
 | `xpg_spots.txt` | strong spots: `x y frame intensity` and, once indexed, `h k l` |

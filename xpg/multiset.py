@@ -311,10 +311,12 @@ def _dcc_null_sd(uid, I, act, ds, nsets, n_rep=2, seed=7, max_obs=200000):
 
 
 def run_multiset(inp_path, outdir=None, log=print, anisotropy=True, reject_nonisomorphous=False, _exclude=(),
-               inp_text=None, export_legacy=False, stop_at_reference=False, prior=None):
+               inp_text=None, export_legacy=False, stop_at_reference=False, prior=None, compare_shells=None):
     """stop_at_reference: when the rejections leave only the reference set, return without re-scaling it alone (an
     evaluation that only needs to know whether anything merges; no outputs, cc_half_cutoff None). prior: a fixed
-    absorption / modulation prior width instead of the cross-validated one."""
+    absorption / modulation prior width instead of the cross-validated one. compare_shells: resolution shells (e.g.
+    another data set's) over which the statistics are also returned (shells_compare, overall_compare), for a
+    comparison at equal resolution."""
     inp_path = Path(inp_path)
     wd = Path(outdir or inp_path.parent)
     wd.mkdir(parents=True, exist_ok=True)
@@ -569,7 +571,7 @@ def run_multiset(inp_path, outdir=None, log=print, anisotropy=True, reject_nonis
         log(f"\n  MERGE: rejecting {len(bad)} data set(s) with negative/outlying Delta-CC1/2 and re-scaling")
         return run_multiset(inp_path, outdir, log, anisotropy, reject_nonisomorphous, tuple(_exclude) + tuple(names),
                           inp_text=inp_text, export_legacy=export_legacy, stop_at_reference=stop_at_reference,
-                          prior=prior)
+                          prior=prior, compare_shells=compare_shells)
     # --- outputs ---
     from .io.mtz import write_unmerged_mtz
     from .outputs import write_merged_outputs
@@ -622,6 +624,12 @@ def run_multiset(inp_path, outdir=None, log=print, anisotropy=True, reject_nonis
         dcut = cc_half_cutoff(fine, 0.3)
         if dcut:
             log(f"  MERGE: CC1/2 = 0.3 resolution estimate {dcut:.2f} A")
+        cmp = {}
+        if compare_shells:
+            sh_c, ov_c, _ = merging_statistics(hasu[a_], plus[a_], Is[a_], ss[a_], cell, sg, dmin=compare_shells[-1].dmin,
+                                               dmax=compare_shells[0].dmax, anomalous=True,
+                                               shell_limits=[s.dmin for s in compare_shells])
+            cmp = dict(shells_compare=sh_c, overall_compare=ov_c)
         base = wd / out["file"]
         if export_legacy or str(out['file']).upper().endswith(('.HKL', '.AHKL')):
             _write_legacy_merged(base, sets, sg, cell, hkl[sel], Is[sel], np.where(act, ss, -ss)[sel], xs[sel], ys[sel],
@@ -634,7 +642,7 @@ def run_multiset(inp_path, outdir=None, log=print, anisotropy=True, reject_nonis
                            Is[a_], ss[a_], xs[a_], ys[a_], phi[a_], np.ones(a_.sum()))
         write_merged_outputs(merged, cell, sg, dcut, wl, Path(f"{stem}"), log=log, anisotropy=anisotropy)
         results[out["file"]] = dict(overall=overall, shells=shells, cc_half_cutoff=dcut, n_obs=int(a_.sum()),
-                                    excluded=list(_exclude) if reject_nonisomorphous else None, **dcc_info)
+                                    excluded=list(_exclude) if reject_nonisomorphous else None, **dcc_info, **cmp)
     results["per_dataset"] = rows
     return results
 

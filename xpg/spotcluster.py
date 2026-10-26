@@ -165,6 +165,8 @@ def _split_merged(z, y, x, v, b, lab, nx, ny, min_sep_xy=2.0, nsig=3.0):
                     return False
             return True
 
+        kept = np.empty(pks.size, np.int64)
+        kept[0], nk = pks[0], 1
         big = pix.size > 20000 or pks.size > 200
         if big:
             # huge merged clusters (dense / crowded images: a connected strong region over many spots): every peak
@@ -173,13 +175,30 @@ def _split_merged(z, y, x, v, b, lab, nx, ny, min_sep_xy=2.0, nsig=3.0):
             # runs only for near pairs, on the pixels around the connecting segment (KD-tree)
             ptree = cKDTree(np.c_[cx, cy, cz])
             far_r = max(4.0 * min_sep_xy, 12.0)
+            # the kept peaks by in-plane cell (side >= far_r: the near ones are in the 3 x 3 cells around a peak) and
+            # the pixels closer than min_sep_xy in-plane to one (a peak there is not separate), so the work per peak
+            # does not grow with the kept peaks: an ice ring on every frame is one cluster with millions of peaks
+            cs = int(np.ceil(far_r))
+            m = int(np.ceil(min_sep_xy))
+            by, bx = (np.array(a, np.int64) for a in zip(*[(i, j) for i in range(-m, m + 1) for j in range(-m, m + 1)
+                                                            if np.hypot(i, j) < min_sep_xy]))
+            x0, y0 = int(x[pix].min()) - m, int(y[pix].min()) - m
+            blocked = np.zeros((int(y[pix].max()) - y0 + m + 1, int(x[pix].max()) - x0 + m + 1), bool)
+            cells = {}
 
-            def separated_from_all(q, rs):      # noqa: F811 -- large-cluster variant of the test above
-                if rs.size == 0:
-                    return True
-                dxy = np.hypot(x[q] - x[rs], y[q] - y[rs])
-                if (dxy < min_sep_xy).any():
+            def mark(q):
+                blocked[y[q] - y0 + by, x[q] - x0 + bx] = True
+                cells.setdefault((int(x[q]) // cs, int(y[q]) // cs), []).append(q)
+
+            def separated_from_all(q, _):      # noqa: F811 -- large-cluster variant of the test above
+                if blocked[y[q] - y0, x[q] - x0]:
                     return False
+                ix, iy = int(x[q]) // cs, int(y[q]) // cs
+                rs = [r for i in (-1, 0, 1) for j in (-1, 0, 1) for r in cells.get((ix + i, iy + j), ())]
+                if not rs:
+                    return True
+                rs = np.sort(np.array(rs, np.int64))
+                dxy = np.hypot(x[q] - x[rs], y[q] - y[rs])
                 D = np.sqrt(dxy ** 2 + (z[q] - z[rs]).astype(float) ** 2)
                 for r in rs[D <= far_r]:
                     a0, a1, a2 = float(x[r]), float(y[r]), float(z[r])
@@ -199,13 +218,16 @@ def _split_merged(z, y, x, v, b, lab, nx, ny, min_sep_xy=2.0, nsig=3.0):
                         return False
                 return True
 
-        keep = [pks[0]]
+            mark(pks[0])
         for q in pks[1:]:   # keep peaks that are significantly separated from every higher kept one
-            if separated_from_all(q, np.array(keep)):
-                keep.append(q)
-        if len(keep) < 2:
+            if separated_from_all(q, kept[:nk]):
+                kept[nk] = q
+                nk += 1
+                if big:
+                    mark(q)
+        if nk < 2:
             continue
-        kp = np.array(keep)
+        kp = kept[:nk]
         tree = cKDTree(np.c_[x[kp], y[kp], z[kp] * 1.5])
         _, ia = tree.query(np.c_[x[pix], y[pix], z[pix] * 1.5])
         new[pix] = c * 4096 + 1 + ia
@@ -229,16 +251,51 @@ class _Accumulator:
         self.divert = tuple(divert)
         self.raw = []
         self.n_raw = 0
+        # clusters still open after a flush (touching its last frame): their pixels, component labels and that frame.
+        # Only their pixels on that frame can connect to later frames, so a flush labels those and the new pixels
+        # and joins the result to the open labels: a cluster on every frame (an ice ring, a streak) is not
+        # re-labelled again and again, which made the clustering quadratic in the number of frames
+        self.open = None
+        self.open_lab = None
+        self.n_open = 0
+        self.open_last = None
 
     def add(self, frame_idx, y, x, val, bg):
         self.buf.append((np.full(y.size, frame_idx, np.int32), y.astype(np.int32), x.astype(np.int32),
                          val.astype(np.float32), bg.astype(np.float32)))
 
+    def _label(self):
+        """Pixels of the open clusters followed by the new ones, with their connected-component labels (numbered by
+        first occurrence, as a labelling of all of them at once)."""
+        new = [np.concatenate(a) for a in zip(*self.buf)] if self.buf else None
+        if self.open is None:
+            z, y, x, v, b = new
+            lab, nc = _components(z, y, x, self.nx, self.ny, self.cluster_radius)
+            return z, y, x, v, b, lab, nc
+        n_open = self.n_open
+        if new is None:
+            return (*self.open, self.open_lab, n_open)
+        anchor = np.flatnonzero(self.open[0] == self.open_last)
+        za, ya, xa = (np.r_[self.open[i][anchor], new[i]] for i in range(3))
+        lab2, nc2 = _components(za, ya, xa, self.nx, self.ny, self.cluster_radius)
+        # open clusters and new components joined through the anchor pixels
+        na, nn = anchor.size, n_open + nc2
+        g = coo_matrix((np.ones(na, np.int8), (self.open_lab[anchor], n_open + lab2[:na])), shape=(nn, nn))
+        nc, comp = connected_components(g, directed=False)
+        # numbered by first occurrence: the clusters with an open one by their first open one (open labels are in
+        # that order), then the new ones (one new component each) in their order
+        key = np.full(nc, nn, np.int64)
+        np.minimum.at(key, comp, np.arange(nn))
+        rank = np.empty(nc, np.int64)
+        rank[np.argsort(key)] = np.arange(nc)
+        node = rank[comp]
+        z, y, x, v, b = (np.r_[self.open[i], new[i]] for i in range(5))
+        return z, y, x, v, b, np.r_[node[self.open_lab], node[n_open + lab2[na:]]], nc
+
     def flush(self, last_frame=None):
-        if not self.buf:
+        if not self.buf and self.open is None:
             return
-        z, y, x, v, b = (np.concatenate(a) for a in zip(*self.buf))
-        lab, nc = _components(z, y, x, self.nx, self.ny, self.cluster_radius)
+        z, y, x, v, b, lab, nc = self._label()
         zmax_c = np.full(nc, -1, np.int64)
         np.maximum.at(zmax_c, lab, z)
         if last_frame is not None:
@@ -260,7 +317,16 @@ class _Accumulator:
             labd = _split_merged(z[done], y[done], x[done], v[done], b[done], lab[done], self.nx, self.ny)
             self.out.append(self._props(z[done], y[done], x[done], v[done], b[done], labd,
                                         lab[done] if self.keyed else None))
-        self.buf = [(z[keep_open], y[keep_open], x[keep_open], v[keep_open], b[keep_open])] if keep_open.any() else []
+        self.buf = []
+        if keep_open.any():
+            self.open = (z[keep_open], y[keep_open], x[keep_open], v[keep_open], b[keep_open])
+            open_c = zmax_c >= last_frame
+            self.open_lab = (np.cumsum(open_c) - 1)[lab[keep_open]]       # still numbered by first occurrence
+            self.n_open = int(open_c.sum())
+            self.open_last = last_frame
+        else:
+            self.open = self.open_lab = self.open_last = None
+            self.n_open = 0
 
     def _props(self, z, y, x, v, b, lab, parent=None):
         u, first, lab = np.unique(lab, return_index=True, return_inverse=True)
@@ -407,7 +473,7 @@ def _edge_jobs(args, raws, n_jobs):
     return [jb for jb in jobs if jb]
 
 
-def _cluster_parallel(q, args, nproc, block_batches):
+def _cluster_parallel(q, args, nproc, block_batches, progress=None):
     """Block-parallel clustering: blocks of consecutive batches are clustered by nproc worker processes, then the
     clusters at block edges, merged in groups that can connect (_edge_jobs), also in parallel. Every
     cluster has the same pixels as in the sequential run, so the same spots, and they are put in the sequential
@@ -420,7 +486,13 @@ def _cluster_parallel(q, args, nproc, block_batches):
         # terminated by the frame loop (error): take the workers along
         signal.signal(signal.SIGTERM, lambda *a: (pool.terminate(), os._exit(1)))
         def submit():
-            futs.append(pool.apply_async(_cluster_block, (args, list(cur), cur[0][0][0] - 1 if futs else None)))
+            n = sum(len(b[0]) for b in cur)
+
+            def done(_):
+                if progress is not None:
+                    progress.value += n
+            futs.append(pool.apply_async(_cluster_block, (args, list(cur), cur[0][0][0] - 1 if futs else None),
+                                         callback=done))
         while True:
             msg = q.get()
             if msg is None:
@@ -448,13 +520,13 @@ def _cluster_parallel(q, args, nproc, block_batches):
     return SpotList(**{k: d[k][order] for k in keys})
 
 
-def _cluster_child(q, conn, args, nproc=1, block_batches=16):
+def _cluster_child(q, conn, args, nproc=1, block_batches=16, progress=None):
     """Clustering process (XPG_SPOTS_PROCESS): the streaming accumulator over the batches arriving on q (None ends),
-    the spot table back on conn."""
+    the spot table back on conn; progress (a shared integer) counts the frames clustered."""
     try:
         conn.send(("ready", None))
         if nproc > 1:
-            conn.send(("ok", _cluster_parallel(q, args, nproc, block_batches).__dict__))
+            conn.send(("ok", _cluster_parallel(q, args, nproc, block_batches, progress).__dict__))
             return
         acc = _Accumulator(*args)
         state = dict(prev=None)
@@ -463,6 +535,8 @@ def _cluster_child(q, conn, args, nproc=1, block_batches=16):
             if msg is None:
                 break
             _cluster_batch(acc, state, *msg)
+            if progress is not None:
+                progress.value += len(msg[0])
         acc.flush()
         conn.send(("ok", acc.result().__dict__))
     except BaseException:

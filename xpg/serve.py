@@ -102,7 +102,7 @@ def _summary(d):
         s = json.loads(p.read_text())
     except ValueError:
         return {}
-    o = s.get("overall") or {}
+    o = (s.get("statistics") or {}).get("overall") or s.get("overall") or {}       # to the limit, as in the PDF
     return dict(space_group=s.get("space_group"), d_cc_half=s.get("cc_half_cutoff"), isa=s.get("isa"),
                 cc_half=o.get("cc_half"), rmeas=o.get("rmeas"), completeness=o.get("completeness"),
                 i_over_sigma=o.get("i_over_sigma"), n_uniq=o.get("n_uniq"), primary=s.get("primary_mtz"))

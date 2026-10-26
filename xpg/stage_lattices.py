@@ -16,6 +16,11 @@ from .scaling import Scaler
 from .symops import apply_rot, to_asu
 LATTICE_TRIAGE = os.environ.get("XPG_LATTICE_TRIAGE", "1") != "0"
 TRIAGE_TOL = 0.05
+# largest mean per-shell CC1/2 loss of the all-lattice merge against the main lattice alone, over the main lattice's
+# shells (to its CC1/2 = 0.3 limit): isomorphous lattices add observations and raise CC1/2, a non-isomorphous one
+# lowers it at every resolution even when the CC1/2 = 0.3 limit holds. Looser in the triage (pass 1, fixed prior)
+CC_LOSS_TOL = 0.05
+TRIAGE_CC_TOL = 0.10
 # the triage merge needs only its CC1/2 resolution limit and exclusions
 TRIAGE_PRIOR = 0.3
 
@@ -51,17 +56,33 @@ class LatticeStage:
         self.st.indexing.extra_lattices = []
         self.st.results["extra_refl"] = {}
 
-    def _merge_verdict(self, d_all, d_main, n_all, tol=0.01):
+    def _merge_verdict(self, d_all, d_main, n_all, tol=0.01, cc_loss=None, cc_tol=CC_LOSS_TOL):
         """(keep, reason, margin) for the merge of all lattices: kept unless it costs resolution (CC1/2 = 0.3 limit,
-        tolerance tol) or claims more than the observations can reach."""
+        tolerance tol), lowers CC1/2 at equal resolution (cc_loss: mean per-shell loss, tolerance cc_tol) or claims
+        more than the observations can reach."""
         # a weak, partly non-isomorphous lattice degrades the merge; no CC1/2 = 0.3 limit for the merge (CC1/2 never
         # reaches 0.3) counts as a loss
         if d_main and (not d_all or d_all > (1.0 + tol) * d_main):
             return False, "costs resolution", (d_all / d_main - 1) if d_all else None
+        if cc_loss is not None and cc_loss > cc_tol:
+            return False, "lowers CC1/2", cc_loss
         d_best = self._plausible_merge_limit(n_all)
         if d_all and d_best and d_all < 0.97 * d_best:
             return False, "implausible", d_best / d_all - 1
         return True, "no resolution loss", (1 - d_all / d_main) if d_all and d_main else None
+
+    def _cc_half_loss(self, r_all):
+        """Mean CC1/2 loss of the all-lattice merge against the main lattice alone over the main lattice's shells (to
+        its CC1/2 = 0.3 limit), with the per-shell values (main, merge); None without both."""
+        main, merge = self.st.results.get("shells_cut"), r_all.get("shells_compare")
+        if not main or not merge or len(main) != len(merge):
+            return None
+        a = np.array([s.cc_half for s in main], float)
+        b = np.array([s.cc_half for s in merge], float)
+        ok = np.isfinite(a) & np.isfinite(b)
+        if not ok.any():
+            return None
+        return float(np.mean(a[ok] - b[ok])), a, b
 
     def _process_extra_lattices(self, merged_main, cell, sg, triage=False):
         """Additional lattices: bring to the main conventional setting (lattice match + indexing-ambiguity
@@ -125,8 +146,14 @@ class LatticeStage:
             res = run_multiset(self.wd / "xpg_lattices", self.wd, log=self.log, anisotropy=self.anisotropy,
                              reject_nonisomorphous="worst", inp_text="\n".join(inp) + "\n",
                              export_legacy=self.p.export_legacy and not triage, stop_at_reference=triage,
-                             prior=TRIAGE_PRIOR if triage else None)
+                             prior=TRIAGE_PRIOR if triage else None,
+                             compare_shells=self.st.results.get("shells_cut"))
             r_all = (res or {}).get("xpg_all_lattices") or {}
+            cc = self._cc_half_loss(r_all)
+            if cc is not None:
+                self.log(f"  LATTICES: CC1/2 on the main lattice's shells, main lattice / all lattices: "
+                         + " ".join(f"{x:.3f}/{y:.3f}" for x, y in zip(cc[1], cc[2]))
+                         + f" (mean loss {cc[0]:+.3f})")
             if triage:
                 # every extra lattice excluded from the merge (Delta-CC1/2 outliers): the 'merge' is the main lattice
                 # alone and costs nothing, but the extra lattices contribute nothing either
@@ -134,19 +161,27 @@ class LatticeStage:
                 if len(files) > 1 and set(files[1:]) <= exc:
                     return False, "every extra lattice excluded from the merge (Delta-CC1/2)"
                 keep, reason, _m = self._merge_verdict(r_all.get("cc_half_cutoff"), self.st.results.get("cc_half_cutoff"),
-                                                       r_all.get("n_obs"), tol=TRIAGE_TOL)
+                                                       r_all.get("n_obs"), tol=TRIAGE_TOL,
+                                                       cc_loss=cc[0] if cc else None, cc_tol=TRIAGE_CC_TOL)
                 return keep, reason
             if r_all.get("excluded") is not None:
                 exc = [Path(f).name for f in r_all["excluded"]]
                 self.decide("lattices dropped from the merge", ", ".join(exc) if exc else "none",
                             evidence=dict(threshold=r_all.get("dcc_threshold"), noise=r_all.get("dcc_noise"),
                                           delta_cc_half=r_all.get("delta_cc_half")))
+                if set(files[1:]) <= set(exc):
+                    # the 'merge' is the main lattice alone, rescaled: the main lattice's own outputs stay primary
+                    self.log("  LATTICES: every extra lattice excluded from the merge (Delta-CC1/2): the main lattice "
+                             "stays the primary output")
+                    self.st.results["primary_mtz"] = "first lattice (every extra lattice excluded from the merge)"
+                    self.decide("lattice merge", "main lattice only (every extra lattice excluded from the merge)")
+                    return
             self._promote_lattice_merge(r_all.get("cc_half_cutoff"), self.st.results.get("cc_half_cutoff"),
-                                        r_all.get("n_obs"))
+                                        r_all.get("n_obs"), cc)
         elif triage:
             return False, "no extra lattice compatible with the main lattice"
 
-    def _promote_lattice_merge(self, d_all=None, d_main=None, n_all=None):
+    def _promote_lattice_merge(self, d_all=None, d_main=None, n_all=None, cc=None):
         """The all-lattice merge becomes the primary MTZ output when it costs no resolution; the first lattice alone
         is kept as xpg_lattice1_*.mtz and xpg_all_lattices_unmerged.mtz holds all of them. XPG_LATTICES_PRIMARY=0:
         the first lattice stays primary."""
@@ -154,7 +189,7 @@ class LatticeStage:
         if os.environ.get("XPG_LATTICES_PRIMARY", "1").upper() in ("0", "F", "FALSE", "N", "NO", "OFF"):
             return
         sfx = ("merged_iso.mtz", "anisotropic.mtz", "unmerged.mtz")
-        keep, reason, margin = self._merge_verdict(d_all, d_main, n_all)
+        keep, reason, margin = self._merge_verdict(d_all, d_main, n_all, cc_loss=cc[0] if cc else None)
         if reason == "costs resolution":
             self.log(f"  LATTICES: the merge of all lattices reaches {f'{d_all:.2f} A' if d_all else 'no CC1/2 = 0.3 limit'} vs {d_main:.2f} A for the main lattice "
                      f"alone (CC1/2 = 0.3): the main lattice stays the primary output (all lattices: "
@@ -163,6 +198,15 @@ class LatticeStage:
             self.decide("lattice merge", "main lattice only (all-lattice merge costs resolution)",
                         margin=margin, unit="relative resolution loss",
                         low=bool(d_all) and d_all < 1.03 * d_main, evidence=dict(d_all=d_all, d_main=d_main))
+            return
+        if reason == "lowers CC1/2":
+            self.log(f"  LATTICES: the merge of all lattices lowers CC1/2 by {cc[0]:.3f} on average over the main "
+                     f"lattice's shells (non-isomorphous lattices): the main lattice stays the primary output (all "
+                     f"lattices: xpg_all_lattices_*.mtz)")
+            self.st.results["primary_mtz"] = "first lattice (all-lattice merge lowers CC1/2)"
+            self.decide("lattice merge", "main lattice only (all-lattice merge lowers CC1/2)", margin=cc[0] - CC_LOSS_TOL,
+                        unit="mean CC1/2 loss above the tolerance", low=cc[0] < CC_LOSS_TOL + 0.03,
+                        evidence=dict(cc_half_main=cc[1].tolist(), cc_half_all=cc[2].tolist(), d_all=d_all, d_main=d_main))
             return
         d_best = self._plausible_merge_limit(n_all)
         if reason == "implausible":

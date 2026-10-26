@@ -2,10 +2,12 @@
 
 Follows the published method of Tickle et al.:
 
-* local mean I/sigma(I) around each reflection, weighted by w = exp(-4 (s/r*)^2) within a
-  sphere of radius r* (default 0.15 1/A), computed as an FFT convolution on the hkl grid;
-* anisotropic cut-off: keep reflections whose local mean I/sigma >= threshold (default 1.2);
-  report principal diffraction limits from an ellipsoid fitted to the cut-off surface;
+* diffraction limit along many directions: in a cone around each direction, the mean I/sigma(I) in resolution bins
+  of equal counts, outward; the limit is where it falls below threshold (default 1.2) for good. Radial bins: a
+  spherical neighbourhood is biased outward at the edge of the data (half of it holds no reflections, the other
+  half the stronger lower-resolution ones);
+* anisotropic cut-off: the ellipsoid fitted through these limits; the reflections inside it are kept, and its
+  principal axes are the reported diffraction limits;
 * maximum-likelihood anisotropic Debye-Waller tensor (traceless, Laue-symmetry constrained)
   using the error-aware Wilson likelihood (French & Wilson formalism; closed form for acentric
   reflections) and a free (binned) isotropic intensity profile;
@@ -29,7 +31,7 @@ from .symops import rot_matrices
 
 
 # ---------------------------------------------------------------------------
-# local I/sigma and cut-off surface
+# I/sigma along directions and the cut-off surface
 # ---------------------------------------------------------------------------
 
 def expand_p1(hkl, values, sg, friedel=True):
@@ -45,35 +47,6 @@ def expand_p1(hkl, values, sg, friedel=True):
     return H[idx], V[idx]
 
 
-def local_mean_isig(hkl, isig, cell, sg, radius=0.15):
-    """Gaussian-weighted local average of I/sigma (FFT convolution on the hkl grid)."""
-    H, V = expand_p1(hkl, isig, sg)
-    hmax = np.abs(H).max(0)
-    B = cell_to_B(cell)
-    # kernel half-width in index units along each axis
-    kw = np.ceil(radius / np.linalg.norm(B, axis=0)).astype(int)
-    shape = tuple(int(2 * (hmax[i] + kw[i]) + 1) for i in range(3))
-    shape = tuple(int(2 ** np.ceil(np.log2(n))) if n > 64 else n for n in shape)
-    grid_v = np.zeros(shape, np.float32)
-    grid_n = np.zeros(shape, np.float32)
-    idx = tuple((H[:, i] % shape[i]) for i in range(3))
-    grid_v[idx] = V
-    grid_n[idx] = 1.0
-    # kernel on the same periodic grid
-    ks = [np.arange(-kw[i], kw[i] + 1) for i in range(3)]
-    K = np.stack(np.meshgrid(*ks, indexing="ij"), -1).reshape(-1, 3)
-    s = np.linalg.norm(K @ B.T, axis=1)
-    w = np.exp(-4.0 * (s / radius) ** 2) * (s <= radius)
-    grid_k = np.zeros(shape, np.float32)
-    grid_k[tuple(K[:, i] % shape[i] for i in range(3))] = w
-    Fk = jnp.fft.rfftn(jnp.asarray(grid_k))
-    num = jnp.fft.irfftn(jnp.fft.rfftn(jnp.asarray(grid_v)) * Fk, s=shape)
-    den = jnp.fft.irfftn(jnp.fft.rfftn(jnp.asarray(grid_n)) * Fk, s=shape)
-    num, den = np_(num), np_(den)
-    sel = tuple(hkl[:, i] % shape[i] for i in range(3))
-    return num[sel] / np.maximum(den[sel], 1e-6)
-
-
 @dataclass
 class AnisoSurface:
     Q: np.ndarray               # ellipsoid matrix (Cartesian reciprocal), s^T Q s = 1 on surface
@@ -81,31 +54,57 @@ class AnisoSurface:
     directions: np.ndarray      # principal directions (Cartesian reciprocal, unit)
     directions_hkl: np.ndarray  # same expressed as reciprocal-lattice (a*, b*, c*) combinations
 
+    def contains(self, hkl, cell):
+        """Reflections inside the cut-off surface: s^T Q s <= 1 with s = B h."""
+        s = np.asarray(hkl, float) @ cell_to_B(cell).T
+        return np.einsum("ni,ij,nj->n", s, self.Q, s) <= 1.0
 
-def fit_cutoff_surface(hkl, local, cell, sg, threshold=1.2, ndir=2000):
-    """Ellipsoid through the outermost reflections with local I/sigma >= threshold."""
-    H, L = expand_p1(hkl, local, sg)
+
+def _radial_limit(r, v, threshold, per_bin):
+    """Outward along one direction: |s| where the mean of v in equal-count resolution bins first falls below threshold
+    and stays below in the next bin (linear interpolation between the bin centres); the outermost |s| when it never
+    does; None when even the innermost bin is below it."""
+    o = np.argsort(r)
+    r, v = r[o], v[o]
+    nb = len(r) // per_bin
+    e = np.linspace(0, len(r), nb + 1).astype(int)
+    mr = np.array([r[a:b].mean() for a, b in zip(e[:-1], e[1:])])
+    mv = np.array([v[a:b].mean() for a, b in zip(e[:-1], e[1:])])
+    above = mv >= threshold
+    if not above[0]:
+        return None
+    for j in range(1, nb):
+        if not above[j] and (j + 1 == nb or not above[j + 1]):
+            return mr[j - 1] + (mv[j - 1] - threshold) / (mv[j - 1] - mv[j]) * (mr[j] - mr[j - 1])
+    return r[-1]
+
+
+def fit_cutoff_surface(hkl, isig, cell, sg, threshold=1.2, ndir=400, cone_deg=15.0, per_bin=40):
+    """Ellipsoid through the diffraction limits along ndir directions (cones of half-angle cone_deg, radial bins of
+    per_bin reflections, _radial_limit)."""
+    H, V = expand_p1(hkl, isig, sg)
     B = cell_to_B(cell)
     S = H @ B.T
     r = np.linalg.norm(S, axis=1)
-    keep = (L >= threshold) & (r > 0)
-    if keep.sum() < 50:
-        keep = r > 0
-    u = S[keep] / r[keep, None]
+    ok = r > 0
+    S, r, V = S[ok], r[ok], V[ok]
+    u = S / r[:, None]
     # directions on a Fibonacci sphere
     k = np.arange(ndir) + 0.5
     th = np.arccos(1 - 2 * k / ndir)
     ph = np.pi * (1 + 5 ** 0.5) * k
     D = np.c_[np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)]
-    from scipy.spatial import cKDTree
-    tree = cKDTree(u)
+    cos_c = np.cos(np.radians(cone_deg))
     pts = []
-    for i, d in enumerate(D):
-        nb = tree.query_ball_point(d, 2 * np.sin(np.radians(4.0)))
-        if len(nb) < 3:
+    for d in D:
+        sel = u @ d >= cos_c
+        if sel.sum() < 3 * per_bin:
             continue
-        rr = r[keep][nb]
-        pts.append(d * np.quantile(rr, 0.98))
+        lim = _radial_limit(r[sel], V[sel], threshold, per_bin)
+        if lim is not None:
+            pts.append(d * lim)
+    if len(pts) < 6:                    # too few directions with signal: the sphere at the data's edge
+        pts = list(D * r.max())
     P = np.array(pts)
     # least squares for symmetric Q: p^T Q p = 1 (6 unknowns)
     A = np.c_[P[:, 0] ** 2, P[:, 1] ** 2, P[:, 2] ** 2, 2 * P[:, 0] * P[:, 1], 2 * P[:, 0] * P[:, 2], 2 * P[:, 1] * P[:, 2]]
@@ -279,14 +278,13 @@ def french_wilson(I, sig, Sigma, centric, chunk=65536):
     return tuple(out)
 
 
-def run_anisotropic(merged, cell, sg, threshold=1.2, radius=0.15, verbose=True, log=print):
+def run_anisotropic(merged, cell, sg, threshold=1.2, verbose=True, log=print):
     """Full anisotropy workflow on merged data (dict from merging.merging_statistics)."""
     hkl = merged["hkl"]
     I, sig = merged["I"], merged["sig"]
     isig = np.where(sig > 0, I / sig, 0.0)
-    local = local_mean_isig(hkl, isig, cell, sg, radius)
-    surf = fit_cutoff_surface(hkl, local, cell, sg, threshold)
-    inside = local >= threshold
+    surf = fit_cutoff_surface(hkl, isig, cell, sg, threshold)
+    inside = surf.contains(hkl, cell)
     # tensor fitted to the reflections inside the cut-off surface, as in the published method; fitting all data within
     # the best limit gave a ~15% smaller anisotropy (the model's Gaussian fall-off is only an approximation over a
     # wide resolution range)
@@ -295,7 +293,7 @@ def run_anisotropic(merged, cell, sg, threshold=1.2, radius=0.15, verbose=True, 
                            merged["eps"][fit_sel], cell, sg, verbose=verbose, log=log)
     Sigma = model.sigma(hkl, cell, merged["eps"])
     F, sF, Ip, sIp = french_wilson(I, sig, Sigma, merged["centric"])
-    res = dict(local_isig=local, inside=inside, F=F, SIGF=sF, Ipost=Ip, SIGIpost=sIp, Sigma=Sigma)
+    res = dict(inside=inside, F=F, SIGF=sF, Ipost=Ip, SIGIpost=sIp, Sigma=Sigma)
     for tag in ("plus", "minus"):
         Ia, sa = merged[f"I{tag}"], merged[f"sigI{tag}"]
         Fa, sFa, _, _ = french_wilson(Ia, sa, Sigma, merged["centric"])
@@ -310,7 +308,8 @@ def run_anisotropic(merged, cell, sg, threshold=1.2, radius=0.15, verbose=True, 
     if verbose:
         lim = surf.limits
         log(f"  ANISO: diffraction limits along principal axes: {lim[0]:.2f} {lim[1]:.2f} {lim[2]:.2f} A "
-            f"(local <I/sigI> >= {threshold}); {inside.sum()}/{len(hkl)} reflections inside the cut-off surface")
+            f"(<I/sigI> >= {threshold} along each direction); {inside.sum()}/{len(hkl)} reflections inside the "
+            f"cut-off surface")
         for d, v in zip(lim, surf.directions_hkl):
             log(f"     {d:6.2f} A along {v[0]:+.3f} a* {v[1]:+.3f} b* {v[2]:+.3f} c*")
     return res, surf, model

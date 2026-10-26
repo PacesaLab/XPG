@@ -208,6 +208,11 @@ def score_symmetry(hkl_red, I, sig, s, phi, cands, isig_limit=6.0, verbose=True,
     # CC ratio 0.72) must not pass for symmetry and the floor stays 0.03.
     gam_sys = 0.1 * cc_true if np.isfinite(L_mean) and L_mean >= L_UNTWINNED else 0.03
     alpha_L = _alpha_from_L(L_mean)
+    # lower bound on the twin fraction (one L_SD): <|L|> is flat above alpha ~0.35 (0.383 -> 0.375 at 0.5), so the
+    # estimate alone reads a 40% twin as a perfect one; the twin mates' CC (0.93 of the expected) then fell outside
+    # the twin-law range, and true symmetry elements (CC as expected) scored higher as 'perfect twin laws' than as
+    # symmetry (P31 twinned by -h,-k,l was taken for point group 2, or 1)
+    alpha_lo = _alpha_from_L(L_mean + L_SD)
     # expected CC of true symmetry mates per resolution half (repeats, half sets + Spearman-Brown): the NCS test
     # compares each element's CC ratio in the two halves (systematic errors ~flat in resolution, NCS decays)
     s_med = float(np.median(s_u[both])) if both.any() else 0.0
@@ -258,7 +263,7 @@ def score_symmetry(hkl_red, I, sig, s, phi, cands, isig_limit=6.0, verbose=True,
         o.pseudo = pseudo
         o.ratio_lo, o.ratio_hi = info.get("ratio_lo", np.nan), info.get("ratio_hi", np.nan)
         if pseudo == "twin":
-            a = alpha_L
+            a = alpha_lo
             o.twin_cc = cc_true * 2 * a * (1 - a) / (a * a + (1 - a) ** 2)
         o.null_mean, o.null_sd = float(np.mean(null)), float(np.std(null) + 1e-6)
         o.z = (cc - o.null_mean) / o.null_sd
