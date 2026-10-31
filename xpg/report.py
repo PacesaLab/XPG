@@ -69,7 +69,8 @@ def build_markdown(pipe) -> str:
         for d in sorted(dec, key=lambda d: not d.get("low_margin")):
             m = "" if d.get("margin") is None else f"{d['margin']:.3g} {d.get('unit', '')}".strip()
             flag = " **(close call: check)**" if d.get("low_margin") else ""
-            L += [f"| {d['name']} | {d['choice']}{flag} | {m} | {'; '.join(d.get('alternatives') or [])} |"]
+            note = f" ({d['note']})" if d.get("note") else ""
+            L += [f"| {d['name']} | {d['choice']}{note}{flag} | {m} | {'; '.join(d.get('alternatives') or [])} |"]
         hints = [d for d in dec if d.get("hint")]
         if hints:
             L += [""] + [f"- *{d['name']}*: {d['hint']}" for d in hints]

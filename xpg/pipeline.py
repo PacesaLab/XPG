@@ -128,13 +128,16 @@ class Pipeline(IndexStage, IntegrateStage, FilterStage, LatticeStage, ScaleStage
                "CORRECT": "SCALE", "ALL": None}
     OLD_NAME = {v: k for k, v in ALIASES.items() if v}
 
-    def decide(self, name, choice, margin=None, unit="", low=None, evidence=None, alternatives=None):
+    def decide(self, name, choice, margin=None, unit="", low=None, evidence=None, alternatives=None, note=None):
         """Record an automatic decision: choice, evidence, alternatives and its margin (posterior probability, log-
         likelihood gap, or distance from the threshold in noise units). Low-margin decisions are flagged in the log,
-        the dashboard and the summary report. The latest record per name is kept (pass 2 replaces pass 1)."""
+        the dashboard and the summary report. The latest record per name is kept (pass 2 replaces pass 1). note: how
+        the call came about when it replaces an earlier one (e.g. a point group decided again on later data)."""
         rec = dict(name=name, choice=str(choice), margin=None if margin is None else float(margin), unit=unit,
                    low_margin=bool(low) if low is not None else False, evidence=evidence or {},
                    alternatives=[str(a) for a in (alternatives or [])])
+        if note:
+            rec["note"] = str(note)
         if rec["low_margin"] and name in CLOSE_CALL_HINTS:
             rec["hint"] = CLOSE_CALL_HINTS[name]
         dec = [d for d in self.st.results.get("decisions", []) if d["name"] != name]
@@ -142,7 +145,8 @@ class Pipeline(IndexStage, IntegrateStage, FilterStage, LatticeStage, ScaleStage
         self.events.emit("decision", **rec)
         m = "" if margin is None else f"; margin {margin:.3g}{(' ' + unit) if unit else ''}"
         alt = f"; alternatives {', '.join(rec['alternatives'])}" if rec["alternatives"] else ""
-        self.log(f"  DECISION {name}: {choice}{m}{alt}{'  [LOW MARGIN: check]' if rec['low_margin'] else ''}"
+        self.log(f"  DECISION {name}: {choice}{m}{alt}{('; ' + rec['note']) if note else ''}"
+                 f"{'  [LOW MARGIN: check]' if rec['low_margin'] else ''}"
                  + (f"\n    hint: {rec['hint']}" if rec.get("hint") else ""))
         return rec
 

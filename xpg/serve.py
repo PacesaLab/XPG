@@ -286,7 +286,7 @@ function stats(){const st=summ&&summ.statistics,sa=summ&&summ.statistics_aniso,a
 function decis(){const audit=new Map(((summ&&summ.audit_merges)||[]).map(a=>[a.label,a.file]));
  return [...decisions.values()].sort((a,b)=>(b.low_margin?1:0)-(a.low_margin?1:0)).map(d=>{
   const alts=(d.alternatives||[]).map(a=>{const lab=a.replace(/ \(.*$/,""),f=audit.get(lab);return f?`${esc(a)} <a href="/file?name=${encodeURIComponent(f)}${RQ}">${esc(f)}</a>`:esc(a)});
-  return `<tr><td style="width:24%" class="muted">${esc(d.name)}${d.pass===2?" (pass 2)":""}</td><td>${d.low_margin?'<span class="close">close call · </span>':""}${esc(d.choice)}`+
+  return `<tr><td style="width:24%" class="muted">${esc(d.name)}${d.pass===2?" (pass 2)":""}</td><td>${d.low_margin?'<span class="close">close call · </span>':""}${esc(d.choice)}${d.note?" ("+esc(d.note)+")":""}`+
   `${d.margin!==null&&d.margin!==undefined?` <span class="muted">(margin ${(+d.margin).toPrecision(3)} ${esc(d.unit||"")})</span>`:""}`+
   `${alts.length?`<div class="muted">alternatives: ${alts.join("; ")}</div>`:""}${d.hint?`<div class="muted">try: ${esc(d.hint)}</div>`:""}</td></tr>`}).join("")}
 function size(b){return b<1e6?(b/1e3).toFixed(0)+" kB":b<1e9?(b/1e6).toFixed(1)+" MB":(b/1e9).toFixed(2)+" GB"}

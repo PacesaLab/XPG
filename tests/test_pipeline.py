@@ -172,3 +172,117 @@ def test_pass2_widths_from_block_fits(tmp_path, monkeypatch):
     log2 = (run / "rerun.log").read_text()
     assert "pass 1 used the default spot widths" not in log2 and "spot widths from the pass-1 per-block fits" not in log2
     assert (st2.model.sigma_d, st2.model.sigma_m) == (st.model.sigma_d, st.model.sigma_m)
+
+
+def test_point_group_redecided_end_to_end(tmp_path, monkeypatch):
+    """Two-pass run whose pass-1 point-group call is forced to a close mP 2 (posterior 0.3) on P 21 21 21 data: the
+    final SCALE decides again on the re-integrated observations as integrated (the kind of input of the pass-1 call,
+    not scaled in mP 2), gives oP 222, selects and scales in that group, and the outputs describe it -- unmerged and
+    merged MTZ, xpg_summary.json, the cell, one record per decision (the earlier call in the note), the report. The
+    pass-2 integration calls the scorer no more. SCALE-only reruns from the pass-2 checkpoint: the real scorer
+    re-decides the same way; a second call confirming the current group leaves every output bit-identical to a run
+    without it (one log line more)."""
+    import dataclasses
+    import gemmi
+    import shutil
+    from xpg.stage_scale import ScaleStage, _rotations_in_basis
+    spec = SimSpec(cell=(41.3, 52.7, 60.1, 90, 90, 90), space_group="P 21 21 21", nx=512, ny=540, orgx=255.3,
+                   orgy=270.6, distance=90.0, osc=0.5, nframes=60, dmin=2.2, gaps=False, mean_i0=8000.0, seed=17)
+    simulate(tmp_path, spec, verbose=False)
+    p = read_input(tmp_path / "xpg.toml")
+    score, calls, seen = ScaleStage._score_point_group, [], []
+
+    def close_mP2_first(self, r, cands, s, log):
+        res = score(self, r, cands, s, log)
+        calls.append(res)
+        seen.append(np.asarray(r["I"]).copy())
+        if len(calls) > 1:
+            return res
+        mp = dataclasses.replace(next(x for x in res[2] if x.cand.bravais == "mP"), prob=0.3)
+        return (mp.cand, mp) + res[2:]
+    monkeypatch.setattr(ScaleStage, "_score_point_group", close_mP2_first)
+    run = tmp_path / "run"
+    run.mkdir()
+    st = Pipeline(p, workdir=run, log=Logger(run / "test.log", echo=False), second_pass=True).run()
+    assert len(calls) == 2 and calls[1][0].point_group == "222"
+    assert np.isin(seen[1], st.refl["I"]).all()             # pass-2 intensities as integrated, not scaled ones
+    assert st.lattice.bravais == "oP" and st.space_group.point_group_hm() == "222" and st.exp.crystal.system == "o"
+    assert np.allclose(np.sort(st.exp.crystal.cell[:3]), spec.cell[:3], rtol=2e-3)
+    for f in ("xpg_unmerged.mtz", "xpg_merged_iso.mtz"):
+        m = gemmi.read_mtz_file(str(run / f))
+        assert m.spacegroup.xhm() == st.space_group.xhm() and np.allclose(m.cell.parameters, st.exp.crystal.cell,
+                                                                            atol=1e-3), f
+    summary = json.loads((run / "xpg_summary.json").read_text())
+    assert summary["space_group"] == st.space_group.xhm() and np.allclose(summary["cell"], st.exp.crystal.cell)
+    assert "audit_merges" not in summary                     # the final call is a confident one
+    pg = [d for d in st.results["decisions"] if d["name"] == "point group"]
+    assert len(pg) == 1 and pg[0]["choice"] == "oP 222" and not pg[0]["low_margin"]
+    assert pg[0]["note"] == "re-decided on the re-integrated data (earlier call mP 2, posterior 0.30)"
+    assert [d["choice"] for d in st.results["decisions"] if d["name"] == "space group"] == [st.space_group.xhm()]
+    log = (run / "test.log").read_text()
+    assert log.count("observations selected again in the new point group") == 1
+    assert log.count("=== SCALE (final) ===") == 1
+    assert "| point group | oP 222 (re-decided on the re-integrated data" in (run / "xpg_summary.md").read_text()
+    # SCALE-only reruns from the pass-2 integration (pass-1 group and record): real scorer; second call confirming
+    # the current group; no second call
+    cur = []
+
+    def confirm(self, r, cands, s, log):
+        res = score(self, r, cands, s, log)
+        same = next(x for x in res[2] if _rotations_in_basis(x.cand.P, x.cand.ops) ==
+                    _rotations_in_basis(self.st.lattice.P, self.st.lattice.ops))
+        cur.append(same.cand.bravais)
+        return (same.cand, same) + res[2:]
+    out = {}
+    for mode, patch in (("real", score), ("same", confirm), ("off", None)):
+        d = tmp_path / mode
+        d.mkdir()
+        shutil.copy(run / "state_INTEGRATE.pkl", d)
+        monkeypatch.setattr(ScaleStage, "_score_point_group", patch or score)
+        if patch is None:
+            monkeypatch.setattr(ScaleStage, "_redecide_point_group", lambda self, *a: False)
+        out[mode] = Pipeline(p, workdir=d, log=Logger(d / "test.log", echo=False), second_pass=False).run(["SCALE"])
+    assert out["real"].space_group.xhm() == st.space_group.xhm() and cur == ["mP"]
+    assert out["same"].space_group.point_group_hm() == "2"
+    a, b = tmp_path / "same", tmp_path / "off"
+    assert (a / "xpg_summary.json").read_text() == (b / "xpg_summary.json").read_text()
+    mtz = sorted(f.name for f in b.glob("*.mtz"))
+    assert "xpg_unmerged.mtz" in mtz and mtz == sorted(f.name for f in a.glob("*.mtz"))
+    for f in mtz:
+        assert np.array_equal(np.array(gemmi.read_mtz_file(str(a / f)), copy=False),
+                              np.array(gemmi.read_mtz_file(str(b / f)), copy=False), equal_nan=True), f
+    la, lb = (a / "test.log").read_text().splitlines(), (b / "test.log").read_text().splitlines()
+    assert len(la) == len(lb) + 1 and sum("SCALE: point group mP 2 kept" in ln for ln in la) == 1
+
+
+def test_point_group_too_high_close_call_redecided(tmp_path, monkeypatch):
+    """A close pass-1 call to a group that is too high -- tP 422 forced at posterior 0.6 on P 21 21 21 data of a
+    pseudo-tetragonal cell (50.0 x 50.05 x 60.1 A) with an NCS 2-fold k,h,-l -- is corrected on the re-integrated
+    data: the final SCALE scores its observations as integrated, on which the NCS element decays with resolution
+    (CC well below its expected value), and the run ends in 222. Scored after scaling in 422 instead, the outlier
+    rejection and error model fitted to the 422 mates remove that evidence and keep the wrong group."""
+    import dataclasses
+    from xpg.stage_scale import ScaleStage
+    spec = SimSpec(cell=(50.0, 50.05, 60.1, 90, 90, 90), space_group="P 21 21 21", ncs_op="k,h,-l", ncs_c=0.3,
+                   ncs_b=20.0, nx=512, ny=540, orgx=255.3, orgy=270.6, distance=90.0, osc=0.5, nframes=90, dmin=2.2,
+                   gaps=False, mean_i0=8000.0, seed=17)
+    simulate(tmp_path, spec, verbose=False)
+    p = read_input(tmp_path / "xpg.toml")
+    score, calls = ScaleStage._score_point_group, []
+
+    def tP422_first(self, r, cands, s, log):
+        res = score(self, r, cands, s, log)
+        calls.append(res)
+        if len(calls) > 1:
+            return res
+        tp = dataclasses.replace(next(x for x in res[2] if (x.cand.bravais, x.cand.point_group) == ("tP", "422")),
+                                 prob=0.6)
+        return (tp.cand, tp) + res[2:]
+    monkeypatch.setattr(ScaleStage, "_score_point_group", tP422_first)
+    run = tmp_path / "run"
+    run.mkdir()
+    st = Pipeline(p, workdir=run, log=Logger(run / "test.log", echo=False), second_pass=True).run()
+    assert len(calls) == 2 and (calls[1][0].bravais, calls[1][0].point_group) == ("oP", "222") and calls[1][1].prob > 0.9
+    assert st.lattice.bravais == "oP" and st.space_group.point_group_hm() == "222" and st.exp.crystal.system == "o"
+    pg = [d for d in st.results["decisions"] if d["name"] == "point group"]
+    assert len(pg) == 1 and pg[0]["choice"] == "oP 222" and "earlier call tP 422" in pg[0]["note"]

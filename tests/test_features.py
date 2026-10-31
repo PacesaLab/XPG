@@ -565,6 +565,133 @@ def test_mr_alternative_point_groups():
     assert _same_basis_alternatives(gemmi.SpaceGroup("P 31 2 1"), ["hP 622 (0.3)", "oC 222 (0.1)"]) == ["P 6 2 2"]
 
 
+def test_mr_alternatives_from_latest_point_group_call(tmp_path):
+    """xpg mr without audit merges takes the alternatives from the run's events: the latest point-group decision is
+    the operative one. A close pass-1 call decided again with confidence on the re-integrated data: nothing to
+    search; the later call a close one itself: its alternatives, not those of pass 1."""
+    import gemmi
+    from types import SimpleNamespace
+    from xpg.events import EventLog
+    from xpg.mr import _close_call_alternatives
+    from xpg.pipeline import Pipeline
+    sg = gemmi.SpaceGroup("P 3 2 1")
+    for final_low, want in ((False, []), (True, ["P 6 2 2"])):
+        d = tmp_path / str(final_low)
+        d.mkdir()
+        pipe = SimpleNamespace(st=SimpleNamespace(results={}), events=EventLog(d), log=lambda *a: None)
+        Pipeline.decide(pipe, "point group", "hP 3", margin=0.5, unit="posterior", low=True,
+                        alternatives=["hP 32 (0.30)", "hP 312 (0.15)"])
+        Pipeline.decide(pipe, "point group", "hP 32", margin=0.6 if final_low else 0.97, unit="posterior",
+                        low=final_low, alternatives=["hP 622 (0.30)"] if final_low else ["hP 3 (0.02)"],
+                        note="re-decided on the re-integrated data (earlier call hP 3, posterior 0.50)")
+        pipe.events.f.close()
+        assert _close_call_alternatives(d / "events.jsonl", sg) == want, final_low
+
+
+def test_earlier_scale_outputs_removed(tmp_path, monkeypatch):
+    """The optional outputs describe the SCALE run that wrote xpg_unmerged.mtz: hidden-twin subgroup files
+    (xpg_unmerged_<symbol>.mtz), detwinned data (xpg_detwinned_*) and anisotropic data (xpg_anisotropic.mtz, analysis
+    off or failed) of an earlier run that this one does not write are removed (after the point group was decided
+    again they are in another setting); this run's own are written.
+    Nothing else goes: xpg_unmerged.mtz, audit merges, extra-lattice outputs, other xpg_unmerged_* names,
+    subdirectories."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    import gemmi
+    import xpg.analysis
+    from xpg import stage_scale
+
+    def merged_out(md, cell, sg, dcut, wl, stem, anisotropy=True, **kw):
+        Path(f"{stem}_merged_iso.mtz").write_text("new")
+        if anisotropy:
+            Path(f"{stem}_anisotropic.mtz").write_text("new")
+            return dict(limits=[2.0] * 3, inside_hkl=np.zeros((1, 3), int))
+    monkeypatch.setattr(stage_scale, "write_merged_outputs", merged_out)
+    monkeypatch.setattr(xpg.analysis, "detwin", lambda hkl, I, sig, sg, op, a: (I, sig, np.ones(len(I), bool)))
+
+    class Pipe(stage_scale.ScaleStage):
+        wd, anisotropy, _hidden_twin, lines = tmp_path, False, None, []
+        p = SimpleNamespace(free_r_reference=None)
+        st = SimpleNamespace(results={})
+        log = lambda self, m: self.lines.append(m)
+        _write_unmerged = lambda self, path, *a, **kw: path.write_text("new")
+    stale = ["xpg_unmerged_P61.mtz", "xpg_unmerged_C2221.mtz", "xpg_unmerged_P31.mtz",
+             "xpg_detwinned_merged_iso.mtz", "xpg_detwinned_anisotropic.mtz", "xpg_anisotropic.mtz"]
+    keep = ["xpg_unmerged.mtz", "xpg_C2221_merged_iso.mtz", "xpg_lattice2_unmerged.mtz", "xpg_all_lattices_unmerged.mtz",
+            "xpg_unmerged_notes.mtz", "xpg_unmerged_P61.json", "sub/xpg_unmerged_P61.mtz",
+            "sub/xpg_detwinned_merged_iso.mtz"]
+    (tmp_path / "sub").mkdir()
+    for n in stale + keep:
+        (tmp_path / n).write_text("old")
+    pipe = Pipe()
+    r, act = {k: np.zeros((2, 3)) for k in ("hkl", "x", "y", "z", "rlp")}, np.ones(2, bool)
+    pipe._hidden_twin = [(gemmi.SpaceGroup("P 31"), "-h,-k,l", 0.45, 0.44)]       # this run: P 31 (rewritten)
+    pipe._write_subgroup_files(None, r, act, np.ones(2), np.ones(2))
+    assert sorted(f.name for f in tmp_path.glob("xpg_unmerged_*.mtz")) == ["xpg_unmerged_P31.mtz",
+                                                                            "xpg_unmerged_notes.mtz"]
+    assert (tmp_path / "xpg_unmerged_P31.mtz").read_text() == "new"
+    assert "removed xpg_unmerged_C2221.mtz, xpg_unmerged_P61.mtz" in pipe.lines[0]
+    pipe._hidden_twin = None                                                         # this run: none
+    pipe._write_subgroup_files(None, r, act, np.ones(2), np.ones(2))
+    assert not (tmp_path / "xpg_unmerged_P31.mtz").exists()
+    merged = dict(hkl=np.zeros((2, 3), int), I=np.ones(2), sig=np.ones(2))
+    pipe._write_merged(merged, None, gemmi.SpaceGroup("P 3 2 1"), None, 1.0, True)  # no twinning, no anisotropy
+    assert not list(tmp_path.glob("xpg_detwinned_*")) and not (tmp_path / "xpg_anisotropic.mtz").exists()
+    assert any(m.startswith("  SCALE: removed xpg_anisotropic.mtz (") for m in pipe.lines)
+    assert "aniso" not in pipe.st.results
+    pipe.st.results["twinning"] = SimpleNamespace(twin_laws=[("-h,-k,l", 0.3, 0.2, 100, 0.21)])
+    (tmp_path / "xpg_detwinned_anisotropic.mtz").write_text("old")
+    pipe.anisotropy = True                                                           # this run's anisotropic data
+    pipe._write_merged(merged, None, gemmi.SpaceGroup("P 3 2 1"), None, 1.0, True)  # alpha 0.2: detwinned
+    assert (tmp_path / "xpg_anisotropic.mtz").read_text() == "new" and pipe.st.results["aniso"] == dict(limits=[2.] * 3)
+    assert [f.name for f in tmp_path.glob("xpg_detwinned_*")] == ["xpg_detwinned_merged_iso.mtz"]
+    assert (tmp_path / "xpg_detwinned_merged_iso.mtz").read_text() == "new"
+    assert all((tmp_path / n).read_text() == "old" for n in keep)
+
+
+def test_mr_hidden_twin_subgroups_from_summary(tmp_path, monkeypatch):
+    """xpg mr searches the hidden-twin subgroups the run's summary lists (pathologies.hidden_twin: the SCALE run that
+    wrote the final data), each from its xpg_unmerged_<SG>.mtz when that exists; a file of an earlier run left in
+    the directory (P 61, before the point group was decided again) is not searched: its group would be merged from
+    the final indices as they stand. Every such file only without a summary."""
+    import json
+    import gemmi
+    import pytest
+    import xpg.matthews
+    import xpg.mr
+
+    def mtz(path, sg):
+        m = gemmi.Mtz(with_base=True)
+        m.spacegroup = gemmi.SpaceGroup(sg)
+        m.set_cell_for_all(gemmi.UnitCell(60, 60, 90, 90, 90, 120))
+        m.add_dataset("x")
+        m.set_data(np.array([[1, 0, 0]], np.float32))
+        m.write_to_file(str(path))
+
+    class Stop(Exception):
+        pass
+    merged = []
+    monkeypatch.setattr(xpg.mr, "prepare_model", lambda model, out: (False, 100, 1))
+    monkeypatch.setattr(xpg.mr, "merge_in", lambda run_dir, a, out, log: merged.append(a) or out)
+    monkeypatch.setattr(xpg.matthews, "model_components", lambda model: [("A", "protein", "M" * 100)])
+    monkeypatch.setattr(xpg.matthews, "write_components", lambda comps, path: path)
+    monkeypatch.setattr(xpg.matthews, "mw_of_components", lambda comps: (_ for _ in ()).throw(Stop()))
+    mtz(tmp_path / "xpg_merged_iso.mtz", "P 31 2 1")
+    mtz(tmp_path / "xpg_unmerged_P31.mtz", "P 31")
+    mtz(tmp_path / "xpg_unmerged_P61.mtz", "P 61")               # an earlier run's
+    ht = dict(space_group="P 31", law="h,-h-k,-l", alpha_h=0.45, alpha_britton=0.44, alpha_l=0.4)
+    for summ, want in ((dict(pathologies=dict(hidden_twin=[ht])), ["P 31"]), ({}, []),
+                       (dict(pathologies=dict(hidden_twin=[dict(ht, space_group="P 32")])), []),
+                       (None, ["P 31", "P 61"])):
+        (tmp_path / "xpg_summary.json").unlink(missing_ok=True)
+        if summ is not None:
+            (tmp_path / "xpg_summary.json").write_text(json.dumps(summ))
+        merged.clear()
+        with pytest.raises(Stop):
+            xpg.mr.run_mr(tmp_path, "model.pdb", None, log=lambda *a: None)
+        assert merged == want, summ
+
+
 def test_fractional_twin_law_matrix():
     """Trigonal 3-fold in a C-centred orthohexagonal cell (fractional matrix): must map allowed reflections onto
     their true symmetry mates, not a floor-divided integer operator."""
@@ -648,3 +775,200 @@ def test_symmetry_decay_model_multiplicity(monkeypatch):
     assert len(true) == 5 and res[0].cand.point_group == "32"
     assert all(abs(o.cc_exp - o.cc) < 0.02 and o.cc_exp < cc_true - 0.03 for o in true), \
         (cc_true, [(o.cc, o.cc_exp) for o in true])
+
+
+def _redecide_pipe(pass1, pass1_sg, low=True, truth="P 6 2 2", turn=0.1):
+    """SCALE + INDEX mixins on synthetic observations of ``truth`` (symsim: the indexing cell is CELL) after a pass-1
+    call ``pass1`` applied as pass 1 does (_apply_lattice: indices and crystal in its conventional setting, then
+    refinement turned the crystal by ``turn`` deg), recorded with posterior 0.16 (low) or 0.95, plus results of the
+    old setting: reference reindexing done, tNCS modulation vector, a frame filter. Decision events are collected in
+    pipe.ev. Returns the pipe, the indexing-cell indices and the gate's inputs (observations, s, reflections in the
+    current setting)."""
+    import gemmi
+    from types import SimpleNamespace
+    from symsim import CELL, observations
+    from xpg.lattice import lattice_candidates
+    from xpg.pipeline import Pipeline
+    from xpg.simulate import SimSpec
+    from xpg.stage_index import IndexStage
+    from xpg.stage_scale import ScaleStage
+    h, I, sig, s, phi = observations(SimSpec(cell=CELL, structure_seed=1000, space_group=truth), seed=0)
+    g = SimpleNamespace(z_to_phi=lambda z: np.asarray(z, float))
+    g.copy = lambda: g
+
+    class Pipe(ScaleStage, IndexStage):
+        decide, _write_audit_merges = Pipeline.decide, Pipeline._write_audit_merges
+        chiral = True
+        log = lambda self, *a: self.lines.append(" ".join(map(str, a)))
+    pipe = Pipe()
+    pipe.lines, pipe.ev = [], []
+    pipe.events = SimpleNamespace(emit=lambda t, **k: pipe.ev.append((t, k)))
+    pipe.p = SimpleNamespace(space_group_number=0, unit_cell=None, reidx=None, reference_data_set=None,
+                             lattice_tolerance=3.0, isig_limit_symmetry=6.0)
+    exp = Experiment(g, Crystal(U=np.eye(3), cell=CELL))
+    pipe.st = SimpleNamespace(results={}, exp=exp, indexing=SimpleNamespace(exp=exp), lattice=None, space_group=None)
+    cand = next(c for c in lattice_candidates(CELL, max_obliq=3.0) if f"{c.bravais} {c.point_group}" == pass1)
+    refl = dict(hkl=h.copy())
+    pipe._apply_lattice(cand, gemmi.SpaceGroup(pass1_sg), refl)
+    t = np.radians(turn)
+    Rx = np.array([[1, 0, 0], [0, np.cos(t), -np.sin(t)], [0, np.sin(t), np.cos(t)]])
+    pipe.st.exp = Experiment(g, Crystal.from_Astar(Rx @ pipe.st.exp.crystal.Astar, cand.system, space_group=pass1_sg))
+    pipe.decide("point group", pass1, margin=0.16 if low else 0.95, unit="posterior", low=low)
+    pipe.decide("frame filter", "3.0% of observations removed", low=False)
+    pipe.st.results.update(reference_applied=True, tncs_modulation=([0.5, 0.0, 0.0], 0.3), removed_image_groups=[7])
+    pipe.lines.clear()
+    return pipe, h, dict(hkl=refl["hkl"].copy(), I=I, sig=sig, z=phi), s, refl
+
+
+def test_point_group_redecided_on_reintegrated_data(tmp_path, monkeypatch):
+    """A close pass-1 call (oC 222 on P 6 2 2 data: on crowded data integrated with the default spot widths, leaked
+    neighbour intensity reads as twinning and the posterior spreads over subgroups) is decided again on the final
+    SCALE's observations, by the same scorer in the primitive basis of the indexing cell: hP 622 replaces it. The
+    observations and the crystal are reindexed to the hexagonal setting (constrained cell), exactly through the
+    lattice applied in pass 1 even after a 3 deg orientation change since indexing (beyond what a map solved against
+    the indexing crystal tolerates), each decision is recorded once with the final values (the earlier call in its
+    note), results of the old setting are dropped, every record is the latest decision event of its name (records of
+    the earlier run kept, as from pass 1 to pass 2), and the decision audit merges the final call's alternatives
+    from the final indices."""
+    import gemmi
+    import xpg.mr
+    from xpg import stage_scale
+    from xpg.models import d_spacing_from_exp
+    real, top = stage_scale.score_symmetry, []
+
+    def close(*a, **k):     # the real scorer; posteriors flattened (order kept) to give the final call alternatives
+        res, ops, cc = real(*a, **k)
+        top.append((f"{res[0].cand.bravais} {res[0].cand.point_group}", res[0].prob))
+        for k_, x in enumerate(res):
+            x.prob = (0.6, 0.25, 0.15)[k_] if k_ < 3 else 0.0
+        return res, ops, cc
+    monkeypatch.setattr(stage_scale, "score_symmetry", close)
+    from xpg.symops import centring_reindex
+    pipe, h, obs, s, refl = _redecide_pipe("oC 222", "C 2 2 2", turn=3.0)
+    st = pipe.st
+    assert centring_reindex(np.linalg.solve(st.indexing.exp.crystal.Astar, st.exp.crystal.Astar), st.space_group) is None
+    red0 = st.exp.crystal.Astar @ np.asarray(st.lattice.P, float).T       # the turned crystal, indexing-cell axes
+    assert pipe._redecide_point_group(obs, s, refl)
+    assert top[0][0] == "hP 622" and top[0][1] > 0.99
+    assert st.lattice.bravais == "hP" and st.space_group.point_group_hm() == "622" and st.exp.crystal.system == "h"
+    assert st.exp.crystal.space_group == st.space_group.xhm()
+    assert np.array_equal(refl["hkl"], h @ st.lattice.P)              # through the primitive basis, exactly
+    # the refined orientation is kept (not the indexing one, 3 deg away): the same reciprocal axes of the indexing
+    # cell (exactly hexagonal, so the constraints of either system leave them)
+    red1 = st.exp.crystal.Astar @ np.asarray(st.lattice.P, float).T
+    cos = np.sum(red0 * red1, 0) / np.linalg.norm(red0, axis=0) / np.linalg.norm(red1, axis=0)
+    assert np.degrees(np.arccos(np.clip(cos, -1, 1))).max() < 0.01 and np.allclose(red1, red0, rtol=1e-6)
+    assert np.allclose(1 / d_spacing_from_exp(refl["hkl"], st.exp), s, rtol=1e-6)
+    pg = [d for d in st.results["decisions"] if d["name"] == "point group"]
+    assert len(pg) == 1 and pg[0]["choice"] == "hP 622" and pg[0]["margin"] == 0.6 and pg[0]["low_margin"]
+    assert pg[0]["note"] == "re-decided on the re-integrated data (earlier call oC 222, posterior 0.16)"
+    sgr = [d for d in st.results["decisions"] if d["name"] == "space group"]
+    assert len(sgr) == 1 and sgr[0]["choice"] == st.space_group.xhm()
+    assert st.space_group.xhm() in st.results["space_group_alternatives"]
+    assert any(ln.startswith("  DECISION point group: hP 622") and "earlier call oC 222" in ln for ln in pipe.lines)
+    assert pipe.lines[-1].endswith("observations selected again in the new point group")
+    assert "reference_applied" not in st.results and st.results["removed_image_groups"] == [7]
+    assert st.results.get("tncs_modulation") != ([0.5, 0.0, 0.0], 0.3)
+    latest = {k["name"]: k for t, k in pipe.ev if t == "decision"}
+    assert latest == {d["name"]: d for d in st.results["decisions"]} and "frame filter" in latest
+    # audit: the final call's alternatives, each reached from the final indices on the lattice of the indexing cell
+    alts = st.results["point_group_alternatives"]
+    assert [a["label"] for a in alts] == [x.rsplit(" (", 1)[0] for x in pg[0]["alternatives"]] and len(alts) == 2
+    (tmp_path / "xpg_unmerged.mtz").write_text("")
+    pipe.wd, merged = tmp_path, []
+    monkeypatch.setattr(xpg.mr, "merge_in", lambda wd, hm, out, log, reindex, cell: merged.append((hm, reindex)))
+    pipe._write_audit_merges()
+    assert [hm for hm, _ in merged] == [gemmi.SpaceGroup(a["space_group"]).hm for a in alts]
+    for a, (hm, Ti) in zip(alts, merged):
+        hp = refl["hkl"] @ np.asarray(Ti, float).T
+        assert np.allclose(hp, np.rint(hp)) and np.allclose(np.linalg.norm(hp @ a["Astar"].T, axis=1), s, rtol=1e-6)
+    assert sum("AUDIT: close point-group call (hP 622, posterior 0.60)" in ln for ln in pipe.lines) == 2
+
+
+def test_point_group_kept_when_reintegrated_data_agree():
+    """The final data confirm the close pass-1 call (hP 622 on P 6 2 2 data): one log line, nothing else changes --
+    indices, crystal, lattice, space group and every result, the earlier record included (the run stays identical
+    to one without the second call). Also with a user space group incompatible with the lattice (P 21 21 21: pass 1
+    ignored it and the scorer made the call). The comparison is by rotation group in the primitive basis: every
+    candidate's operators give the same set as its space group's, and the six mC 2 settings of a hexagonal lattice,
+    one label, are six different groups."""
+    import copy
+    from symsim import CELL
+    from xpg.lattice import lattice_candidates
+    from xpg.stage_scale import _rotations_in_basis
+    from xpg.symops import rot_matrices
+    cands = lattice_candidates(CELL, max_obliq=3.0)
+    assert all(_rotations_in_basis(c.P, c.ops) == _rotations_in_basis(c.P, rot_matrices(c.space_group)) for c in cands)
+    assert len({frozenset(_rotations_in_basis(c.P, c.ops)) for c in cands if c.bravais == "mC"}) == 6
+    for user_sg in (0, 19):
+        pipe, h, obs, s, refl = _redecide_pipe("hP 622", "P 6 2 2")
+        pipe.p.space_group_number = user_sg
+        st = pipe.st
+        before, hkl0, objs = copy.deepcopy(st.results), refl["hkl"].copy(), (st.exp, st.lattice, st.space_group)
+        assert not pipe._redecide_point_group(obs, s, refl)
+        assert np.array_equal(refl["hkl"], hkl0) and all(a is b for a, b in zip((st.exp, st.lattice, st.space_group),
+                                                                                objs))
+        assert st.results == before
+        assert pipe.lines == ["  SCALE: point group hP 622 kept: the re-integrated data give the same group (posterior "
+                              "1.00 on them, 0.16 in the earlier call)"], user_sg
+
+
+def test_point_group_not_redecided(monkeypatch):
+    """A confident pass-1 call (posterior >= 0.9), a call already made again on re-integrated data (its note: e.g. a
+    SCALE-only run on the pass-2 integration followed by a second pass), a space group given by the user that the
+    lattice allows (P 6 2 2), a reindexing given by the user, no recorded call (user cell and space group applied at
+    indexing) or no indexing result: the final SCALE runs no second call -- the scorer is not called, nothing is
+    logged or changed."""
+    from xpg import stage_scale
+
+    def never(*a, **k):
+        raise AssertionError("scorer called")
+    monkeypatch.setattr(stage_scale, "score_symmetry", never)
+    for case in ("confident", "re-decided", "space group", "reindexing", "no record", "no indexing"):
+        pipe, h, obs, s, refl = _redecide_pipe("oC 222", "C 2 2 2", low=case != "confident")
+        if case == "re-decided":
+            pipe.st.results["decisions"][0]["note"] = "re-decided on the re-integrated data (earlier call mC 2, " \
+                                                      "posterior 0.40)"
+        elif case == "space group":
+            pipe.p.space_group_number = 177
+        elif case == "reindexing":
+            pipe.p.reidx = np.array([[0, 1, 0, 0], [1, 0, 0, 0], [0, 0, -1, 0]], float)
+        elif case == "no record":
+            pipe.st.results["decisions"] = []
+        elif case == "no indexing":
+            pipe.st.indexing = None
+        before, hkl0 = dict(pipe.st.results), refl["hkl"].copy()
+        assert not pipe._redecide_point_group(obs, s, refl), case
+        assert pipe.lines == [] and np.array_equal(refl["hkl"], hkl0) and pipe.st.results == before, case
+
+
+def test_point_group_redecided_between_mc_settings(monkeypatch):
+    """The gate compares rotation groups, not labels: on P 6 2 2 data (hexagonal lattice) pass 1 applied one of the
+    six mC 2 settings (A, a close call); the re-integrated data give another (B, a 2-fold along another axis), the
+    same label 'mC 2' (and space group C 1 2 1) but another group: decided again, observations and crystal in B's
+    setting, exactly through the primitive basis."""
+    from symsim import CELL
+    from xpg import stage_scale
+    from xpg.lattice import lattice_candidates
+    from xpg.stage_scale import _rotations_in_basis
+    rot = lambda c: _rotations_in_basis(c.P, c.ops)
+    mcs = [c for c in lattice_candidates(CELL, max_obliq=3.0) if c.bravais == "mC"]
+    A, B = mcs[0], mcs[1]
+    assert A.space_group == B.space_group and rot(A) != rot(B)
+    real = stage_scale.score_symmetry
+
+    def forced(*a, **k):       # the real scorer, setting B put first
+        res, ops, cc = real(*a, **k)
+        j = next(i for i, x in enumerate(res) if x.cand.bravais == "mC" and rot(x.cand) == rot(B))
+        res = [res[j]] + res[:j] + res[j + 1:]
+        res[0].prob = 0.8
+        return res, ops, cc
+    monkeypatch.setattr(stage_scale, "score_symmetry", forced)
+    pipe, h, obs, s, refl = _redecide_pipe("mC 2", A.space_group)
+    st = pipe.st
+    assert rot(st.lattice) == rot(A)
+    assert pipe._redecide_point_group(obs, s, refl)
+    assert rot(st.lattice) == rot(B) and st.space_group.xhm() == "C 1 2 1"
+    assert np.array_equal(refl["hkl"], h @ st.lattice.P)
+    pg = [d for d in st.results["decisions"] if d["name"] == "point group"]
+    assert len(pg) == 1 and pg[0]["choice"] == "mC 2" and pg[0]["margin"] == 0.8 and "earlier call mC 2" in pg[0]["note"]

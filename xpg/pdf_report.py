@@ -60,6 +60,12 @@ def _image_from_run(d, run):
         return None
 
 
+def _choice(e):
+    """A decision's choice as the reports give it: its note (how the call came about, e.g. a point group decided
+    again on later data) in parentheses after it."""
+    return e["choice"] + (f" ({e['note']})" if e.get("note") else "")
+
+
 def _problems(D):
     """(level, title, text) of what to check, most severe first."""
     out = []
@@ -73,7 +79,9 @@ def _problems(D):
     for name, e in D["decisions"].items():
         if e.get("low_margin"):
             alts = "; ".join(e.get("alternatives") or [])
-            out.append(("close", f"close call: {name}", f"{e['choice']}" + (f" (alternatives: {alts})" if alts else "")))
+            # the note last: the two-line cut takes it before the alternatives (the decisions panel shows it too)
+            out.append(("close", f"close call: {name}", e["choice"] + (f" (alternatives: {alts})" if alts else "") +
+                        (f" ({e['note']})" if e.get("note") else "")))
     pa = (D["summary"] or {}).get("pathologies") or {}
     tn = pa.get("tncs") or {}
     if tn.get("present"):
@@ -305,8 +313,13 @@ def _page1(pdf, D, img):
         y = 1 - (i + 0.8) / 10
         ax.text(0.0, y, e["name"], fontsize=6.8, color=INK2)
         m = e.get("margin")
-        ax.text(0.27, y, (e["choice"][:80]) + (f"   (margin {m:.3g} {e.get('unit', '')})" if m is not None else ""),
-                fontsize=6.8, color=INK)
+        mt = f"   (margin {m:.3g} {e.get('unit', '')})" if m is not None else ""
+        if not e.get("note") or len(_choice(e) + mt) <= 76:      # (one line: every row without a note)
+            ax.text(0.27, y, _choice(e)[:80] + mt, fontsize=6.8, color=INK)
+        else:       # (a long note: at most two smaller lines in the row, left of the close-call mark)
+            ln = textwrap.wrap(_choice(e) + mt, 90, max_lines=2, placeholder=" …")
+            ax.text(0.27, y + (0.22 / 10 if len(ln) > 1 else 0), "\n".join(ln), fontsize=5.6, color=INK,
+                    va="center" if len(ln) > 1 else "baseline", linespacing=1.15)
         if e.get("low_margin"):
             ax.text(0.93, y, "◆ close call", fontsize=6.3, color=STATUS["close"][0], fontweight="bold", ha="right")
         ax.plot([0, 1], [y - 0.3 / 10] * 2, color=GRID, lw=0.4)

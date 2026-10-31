@@ -114,6 +114,46 @@ def _same_basis_alternatives(sg_run, alt_labels):
     return out
 
 
+def _close_call_alternatives(events_path, sg_run):
+    """Same-basis alternatives of the run's point-group call from its events (events.jsonl): the latest 'point group'
+    decision is the operative one (pass 1, then the call made again on the re-integrated data); its alternatives
+    count only when that call is a close one (low margin)."""
+    last = None
+    for line in Path(events_path).read_text().splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if ev.get("type") == "decision" and ev.get("name") == "point group":
+            last = ev
+    if last is None or not last.get("low_margin"):
+        return []
+    return _same_basis_alternatives(sg_run, last.get("alternatives", []))
+
+
+def _hidden_twin_groups(run_dir, summ):
+    """Subgroups the twinning check could not tell from the merged group (the true space group may be a subgroup
+    twinned to look like it), with their data files xpg_unmerged_<SG>.mtz: those the run's summary lists
+    (pathologies.hidden_twin of the SCALE run that wrote the final data) whose file exists, so that a file of an
+    earlier run (another setting, e.g. before the point group was decided again) is never searched; every such
+    file only without a summary (summ None). Returns [(space group, file name)]."""
+    run_dir = Path(run_dir)
+    out = []
+    if summ is not None:
+        hz = (summ.get("pathologies") or {}).get("hidden_twin")
+        for h in ([hz] if isinstance(hz, dict) else (hz or [])):          # (a single dict: one entry, as in the report)
+            f = run_dir / f"xpg_unmerged_{h['space_group'].replace(' ', '')}.mtz"
+            if f.is_file():
+                out.append((gemmi.SpaceGroup(h["space_group"]).hm, f.name))
+        return out
+    for f in sorted(run_dir.glob("xpg_unmerged_*.mtz")):
+        try:
+            out.append((gemmi.read_mtz_file(str(f)).spacegroup.hm, f.name))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 # TFZ: z-score of the last copy placed against random positions of its orientation (fast LLG, xpg.mrsearch); solved
 # from 8 (correct solutions: 10-34, with tNCS 10; wrong search models: up to 6)
 SOLVED_Z = 8.0
@@ -341,24 +381,12 @@ def run_mr(run_dir, model, sequence, copies=None, alternatives=None, log=print, 
         data[lab] = run_dir / a["file"]
         reindex[lab] = np.array(a["reindex"]) if "reindex" in a else None
     if not alts and not audit and (run_dir / "events.jsonl").exists():
-        for line in (run_dir / "events.jsonl").read_text().splitlines():
-            try:
-                ev = json.loads(line)
-            except ValueError:
-                continue
-            if ev.get("type") == "decision" and ev.get("name") == "point group" and ev.get("low_margin"):
-                alts = _same_basis_alternatives(sg_run, ev.get("alternatives", []))
+        alts = _close_call_alternatives(run_dir / "events.jsonl", sg_run)
     if not alternatives:
-        # subgroups the twinning check could not tell apart (xpg_unmerged_<SG>.mtz: true space group may be a
-        # subgroup twinned to look like the merged one)
-        for f in sorted(run_dir.glob("xpg_unmerged_*.mtz")):
-            try:
-                a = gemmi.read_mtz_file(str(f)).spacegroup.hm
-            except Exception:  # noqa: BLE001
-                continue
+        for a, fn in _hidden_twin_groups(run_dir, summ if (run_dir / "xpg_summary.json").exists() else None):
             if a not in alts:
                 alts.append(a)
-                log(f"MR: twinning check lists {a} as a possible true space group ({f.name})")
+                log(f"MR: twinning check lists {a} as a possible true space group ({fn})")
     from .lattice import _rotations
     for a in alts:
         lab = a.replace(" ", "")

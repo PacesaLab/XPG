@@ -374,6 +374,66 @@ def test_pdf_report(tmp_path):
         out.read_bytes().count(b"/Type /Page ") >= 2
 
 
+def test_decision_note_in_reports(tmp_path):
+    """A decision's note (a point group decided again on the re-integrated data) follows its choice, as in the
+    markdown report, in the PDF report (decisions panel: two smaller lines left of the close-call mark, rows without
+    a note drawn as always; check panel: the note after the alternatives, which the two-line cut keeps) and on the
+    dashboard (HTML-escaped; the page's own decis() run in node when available)."""
+    import json
+    import re
+    import shutil
+    import subprocess
+    from types import SimpleNamespace
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from xpg.pdf_report import _choice, _load, _page1, _problems, write_pdf_report
+    from xpg.serve import PAGE
+    note = "re-decided on the re-integrated data (earlier call oC 222, posterior 0.16)"
+    alts = ["hP 6 (0.25)", "oC 222 (0.10)", "hP 312 (0.03)"]
+    lm = "main lattice only (all-lattice merge lowers CC1/2)"
+    ev = [dict(t=0, type="run_start", template="x_????.cbf", frames=[1, 90]),
+          dict(t=1, type="decision", name="point group", choice="hP 622", margin=0.6, unit="posterior",
+               low_margin=True, alternatives=alts, note=note),
+          dict(t=2, type="decision", name="space group", choice="P 61 2 2", margin=3.0, unit="log-likelihood",
+               low_margin=False, alternatives=[]),
+          dict(t=3, type="decision", name="lattice merge", choice=lm, margin=0.0123,
+               unit="mean CC1/2 loss above the tolerance", low_margin=False)]
+    (tmp_path / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in ev))
+    D = _load(tmp_path)
+    assert _choice(D["decisions"]["point group"]) == f"hP 622 ({note})" and _choice(D["decisions"]["space group"]) \
+        == "P 61 2 2"
+    assert [p[2] for p in _problems(D) if p[0] == "close"] == [f"hP 622 (alternatives: {'; '.join(alts)}) ({note})"]
+    assert write_pdf_report(tmp_path, log=lambda *a: None) is not None
+    figs = []
+    with plt.rc_context({"font.family": "DejaVu Sans", "pdf.fonttype": 42}):
+        _page1(SimpleNamespace(savefig=figs.append), D, None)
+        rd = FigureCanvasAgg(figs[0]).get_renderer()        # (the page closed it)
+        panel = lambda title: next(list(a.texts) for a in figs[0].axes if any(t.get_text() == title for t in a.texts))
+        tx = panel("Decisions")
+        row = {t.get_text(): tx[i:i + 3] for i, t in enumerate(tx) if t.get_text() in {e["name"] for e in ev[1:]}}
+        name, pg, mark = row["point group"]
+        assert pg.get_text() == f"hP 622 ({note})\n(margin 0.6 posterior)" and mark.get_text() == "◆ close call"
+        assert pg.get_window_extent(rd).x1 < mark.get_window_extent(rd).x0
+        for k, want in (("space group", "P 61 2 2   (margin 3 log-likelihood)"),
+                        ("lattice merge", f"{lm}   (margin 0.0123 mean CC1/2 loss above the tolerance)")):
+            name, t = row[k][:2]         # one line on the row's baseline, as without notes
+            assert t.get_text() == want and t.get_fontsize() == 6.8 and t.get_position()[1] == name.get_position()[1]
+            assert t.get_va() == "baseline"
+        tx = panel("Check")
+        body = next(tx[i + 1] for i, t in enumerate(tx) if t.get_text() == "close call: point group").get_text()
+        assert body.split("\n")[0] == f"hP 622 (alternatives: {'; '.join(alts)})" and body.endswith("…")
+    plt.close("all")
+    if shutil.which("node"):
+        fn = lambda n: re.search(r"^function %s\(.*?(?=^function |^</script>)" % n, PAGE, re.S | re.M).group(0)
+        dec = [[e["name"], dict(e, note=e.get("note") and "<b>&" + note)] for e in ev[1:]]
+        js = fn("esc") + fn("decis") + f"const RQ='',summ=null,decisions=new Map({json.dumps(dec)});" \
+            "process.stdout.write(decis())"
+        html = subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout
+        assert f"hP 622 (&lt;b&gt;&amp;{note})" in html and "P 61 2 2 <span" in html
+
+
 def test_completeness_limit():
     """Resolution limit from the thin-shell completeness, relative to the completeness inside the complete circle on
     the detector: falling edge towards the corners cut, interior dips (ice rings) and uniformly incomplete data not."""

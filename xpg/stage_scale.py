@@ -9,7 +9,7 @@ from pathlib import Path
 import gemmi
 import numpy as np
 
-from .geometry import rotation_matrices_np
+from .geometry import cell_from_Astar, rotation_matrices_np
 from .ice import ice_spot_bands
 from .io.legacy import write_legacy_hkl, write_xparm
 from .io.mtz import write_unmerged_mtz
@@ -24,7 +24,7 @@ from .scaling import Scaler
 from .stage_filters import FILTER_CYCLES
 from .stage_lattices import LATTICE_TRIAGE
 from .symmetry import score_space_groups, score_symmetry
-from .symops import apply_rot, to_asu
+from .symops import apply_rot, centring_reindex, rot_matrices, to_asu
 
 
 # tNCS weak class with another spot shape (_combine_prf_sum): "scale" = its profile intensities scaled by the class
@@ -36,6 +36,36 @@ TNCS_MIN_RATIO = 1.4
 def _stats(s):
     """Merging statistics of a shell as plain numbers (JSON)."""
     return {k: (float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v) for k, v in s.__dict__.items()}
+
+
+# hidden-twin subgroup files (job_scale): xpg_unmerged_<symbol>.mtz, <symbol> the compact symbol of a reference
+# setting (the only settings written). Only these names are removed as an earlier run's: never xpg_unmerged.mtz,
+# audit merges (xpg_<SG>_merged_iso.mtz), extra-lattice outputs (xpg_lattice<k>_*, xpg_all_lattices_*) or other
+# xpg_unmerged_* files, none of them written here
+SUBGROUP_FILES = frozenset(f"xpg_unmerged_{g.xhm().replace(' ', '')}.mtz" for g in gemmi.spacegroup_table()
+                           if g.is_reference_setting())
+
+
+def _remove_outputs(wd, names, log):
+    """Remove the files ``names`` of the work directory wd (none of its subdirectories) written by an earlier SCALE
+    run and not by this one: the optional outputs describe the run that wrote xpg_unmerged.mtz. Logs what went."""
+    gone = []
+    for n in sorted(set(names)):
+        f = Path(wd) / n
+        if f.parent == Path(wd) and f.is_file():
+            f.unlink()
+            gone.append(n)
+    if gone:
+        log(f"  SCALE: removed {', '.join(gone)} (an earlier SCALE run's; not written by this one)")
+
+
+def _rotations_in_basis(P, rots):
+    """Rotations written in a basis with h = P^T h_red (h @ P for row vectors), as the set of the integer matrices
+    P R P^-1 of the primitive basis: equal sets are the same point group, whatever setting either is written in (the
+    six mC settings of a hexagonal lattice share the label 'mC 2', not the 2-fold)."""
+    P = np.asarray(P, float)
+    Pi = np.linalg.inv(P)
+    return {np.rint(P @ np.asarray(R, float) @ Pi).astype(np.int64).tobytes() for R in rots}
 
 
 class ScaleStage:
@@ -242,6 +272,14 @@ class ScaleStage:
             self._apply_lattice(cand, sg, refl)       # also reindexes refl (and REIDX)
             r["hkl"] = refl["hkl"][sel]
             exp = self.st.exp
+        elif self._redecide_point_group(dict(hkl=r["hkl"], I=r["I"], sig=r["sig"], z=r["z"]), s, refl):
+            # another point group (refl and crystal reindexed): the selection is made again with its symmetry mates
+            # (ice rings validated against them, overloads kept for reflections without another observation)
+            self.st.results.pop("ice_rings_excluded", None)
+            exp = self.st.exp
+            sel = self._select_observations(refl, report=True)
+            r = {k: (v[sel] if isinstance(v, np.ndarray) and v.shape[:1] == sel.shape else v) for k, v in refl.items()}
+            s = 1.0 / d_spacing_from_exp(r["hkl"], exp)
         sg = self.st.space_group
         cand = self.st.lattice
         # ---- REFERENCE_DATA_SET: resolve indexing ambiguity against a reference data set ----
@@ -481,14 +519,7 @@ class ScaleStage:
                             data_range=p.data_range,
                             sigma_m=self.st.model.sigma_m, sigma_d=self.st.model.sigma_d, template=p.name_template,
                             dmin=float(1 / s.max()), variance_model=(sc.sd[0] ** 2, sc.sd[2] ** 2))
-        for sub_t in (getattr(self, "_hidden_twin", None) or []):
-            if not sub_t[0].is_reference_setting():
-                continue
-            # same observations in the subgroup (same axes and indices): input for MR / twin refinement
-            fn = f"xpg_unmerged_{sub_t[0].xhm().replace(' ', '')}.mtz"
-            self._write_unmerged(self.wd / fn, exp, sub_t[0], r["hkl"][act], Is[act], ss[act], r["x"][act], r["y"][act],
-                                 r["z"][act], r["rlp"][act], geometry=False)
-            self.log(f"  TWINNING: data in {sub_t[0].xhm()} written to {fn}")
+        self._write_subgroup_files(exp, r, act, Is, ss)
         self._write_unmerged(self.wd / "xpg_unmerged.mtz", exp, sg, r["hkl"][act], Is[act], ss[act], r["x"][act],
                              r["y"][act], r["z"][act], r["rlp"][act], geometry=True)
         self._write_merged(merged, cell, sg, dcut, g.wavelength, final)
@@ -865,21 +896,43 @@ class ScaleStage:
         except Exception:  # pragma: no cover (diagnostic only)
             pass
 
+    def _user_group_match(self, cands):
+        """Candidates of the lattice in the user's space group (SPACE_GROUP_NUMBER: its point group and centring),
+        closest to UNIT_CELL_CONSTANTS first; empty without a user group or when it is incompatible with the lattice
+        (the scorer decides then)."""
+        p = self.p
+        if p.space_group_number <= 0:
+            return []
+        want = gemmi.find_spacegroup_by_number(p.space_group_number)
+        pg = want.point_group_hm()
+        match = [c for c in cands if gemmi.SpaceGroup(c.space_group).point_group_hm() == pg
+                 and c.bravais[1] == want.hm[0]]
+        if p.unit_cell is not None and match:
+            match.sort(key=lambda c: np.abs(c.cell[:3] - np.array(p.unit_cell[:3])).sum()
+                       + np.abs(c.cell[3:] - np.array(p.unit_cell[3:])).sum())
+        return match
+
     def _choose_symmetry(self, r, cands, s):
         p = self.p
-        phi = self.st.exp.geom.z_to_phi(r["z"])
         if p.space_group_number > 0:
             want = gemmi.find_spacegroup_by_number(p.space_group_number)
-            pg = want.point_group_hm()
-            match = [c for c in cands if gemmi.SpaceGroup(c.space_group).point_group_hm() == pg
-                     and c.bravais[1] == want.hm[0]]
-            if p.unit_cell is not None and match:
-                match.sort(key=lambda c: np.abs(c.cell[:3] - np.array(p.unit_cell[:3])).sum()
-                           + np.abs(c.cell[3:] - np.array(p.unit_cell[3:])).sum())
+            match = self._user_group_match(cands)
             if match:
                 self.log(f"  SCALE: using user-defined space group {want.xhm()}")
                 return match[0], want
             self.log(f"  SCALE WARNING: SPACE_GROUP_NUMBER={p.space_group_number} incompatible with lattice; ignoring")
+        best, chosen_score, scores, opsc, cc_true, rec = self._score_point_group(r, cands, s, self.log)
+        self.st.results.update(rec)
+        return best, self._space_group_and_decisions(r, best, chosen_score, scores, opsc, cc_true,
+                                                     self.st.exp.crystal.Astar)
+
+    def _score_point_group(self, r, cands, s, log):
+        """Point-group call on the observations r (hkl in the basis of the candidates' reduced cell, I, sig, z):
+        the scorer (symmetry.score_symmetry) with ice-ring bands left out and the underpowered-test rule. No state
+        is written: returns (candidate, its GroupScore, all scores, element scores, expected CC, results entries)."""
+        p = self.p
+        phi = self.st.exp.geom.z_to_phi(r["z"])
+        rec = {}
         # reflections on a sharp ice ring carry its excess counts in every repeat (the background annulus lies mostly
         # off the ring) and decorrelate true symmetry mates at those resolutions; the NCS test then reads the deficit
         # as pseudo-symmetry decaying with resolution. Such bands are left out of the symmetry test only.
@@ -888,11 +941,11 @@ class ScaleStage:
         for lo, hi in bands:
             use &= ~((1.0 / s >= lo) & (1.0 / s <= hi))
         if bands:
-            self.log("  SYMMETRY: ice-ring bands left out of the symmetry test (excess of Wilson-implausible "
-                     "reflections): " + ", ".join(f"{a:.3f}-{b:.3f}" for a, b in bands) + f" A ({int((~use).sum())} obs)")
-            self.st.results["symmetry_ice_bands"] = [list(b) for b in bands]
+            log("  SYMMETRY: ice-ring bands left out of the symmetry test (excess of Wilson-implausible "
+                "reflections): " + ", ".join(f"{a:.3f}-{b:.3f}" for a, b in bands) + f" A ({int((~use).sum())} obs)")
+            rec["symmetry_ice_bands"] = [list(b) for b in bands]
         scores, opsc, cc_true = score_symmetry(r["hkl"][use], r["I"][use], r["sig"][use], s[use], phi[use], cands,
-                                               isig_limit=p.isig_limit_symmetry, log=self.log)
+                                               isig_limit=p.isig_limit_symmetry, log=log)
         best = scores[0].cand
         chosen_score = scores[0]
         # power of the test: a pseudo-symmetry element (NCS) correlates at a fraction f ~ 0.8 of a true element;
@@ -907,13 +960,19 @@ class ScaleStage:
             lower = [sc for sc in scores if order(sc.cand) < order(best)]
             low = max(lower, key=lambda sc: sc.prob) if lower else scores[0]
             if order(low.cand) < order(best):
-                self.log(f"  SYMMETRY WARNING: test underpowered (expected CC for true symmetry {cc_true:.2f} < 0.45) and "
-                         f"{best.bravais} {best.point_group} only {scores[0].prob:.2f} probable: using the lower symmetry "
-                         f"{low.cand.bravais} {low.cand.point_group} (alternative {best.bravais} {best.point_group} "
-                         f"reported; pseudo-symmetry cannot be excluded)")
-                self.st.results["symmetry_alternative"] = f"{best.bravais} {best.point_group}"
+                log(f"  SYMMETRY WARNING: test underpowered (expected CC for true symmetry {cc_true:.2f} < 0.45) and "
+                    f"{best.bravais} {best.point_group} only {scores[0].prob:.2f} probable: using the lower symmetry "
+                    f"{low.cand.bravais} {low.cand.point_group} (alternative {best.bravais} {best.point_group} "
+                    f"reported; pseudo-symmetry cannot be excluded)")
+                rec["symmetry_alternative"] = f"{best.bravais} {best.point_group}"
                 best = low.cand
                 chosen_score = low
+        return best, chosen_score, scores, opsc, cc_true, rec
+
+    def _space_group_and_decisions(self, r, best, chosen_score, scores, opsc, cc_true, Ast0, note=None):
+        """Space group of the chosen point group from the absences (r: reduced-cell observations), the "point group"
+        and "space group" decision records and the audit alternatives; Ast0: the reciprocal basis of r's indices in
+        the lab frame. Returns the space group."""
         # space group from absences: merge in the point group (conventional cell)
         hc = r["hkl"] @ best.P
         pg_sg = gemmi.SpaceGroup(best.space_group)
@@ -951,10 +1010,9 @@ class ScaleStage:
         alts = [x for x in scores if x is not chosen_score and x.prob > 0.01][:3]
         self.decide("point group", f"{best.bravais} {best.point_group}", margin=chosen_score.prob, unit="posterior",
                     low=chosen_score.prob < 0.9, evidence=dict(expected_cc=float(cc_true), pseudo_symmetry=pseudo),
-                    alternatives=[f"{x.cand.bravais} {x.cand.point_group} ({x.prob:.2f})" for x in alts])
+                    alternatives=[f"{x.cand.bravais} {x.cand.point_group} ({x.prob:.2f})" for x in alts], note=note)
         # for the decision audit (_write_audit_merges): each alternative's conventional reciprocal basis in the lab
         # frame, so the final data can be mapped to it whatever reindexing follows
-        Ast0 = self.st.exp.crystal.Astar
         self.st.results["point_group_alternatives"] = [
             dict(label=f"{x.cand.bravais} {x.cand.point_group}", space_group=x.cand.space_group, prob=float(x.prob),
                  cell=np.asarray(x.cand.cell, float), Astar=Ast0 @ np.linalg.inv(np.asarray(x.cand.P, float).T))
@@ -963,26 +1021,121 @@ class ScaleStage:
         self.decide("space group", sg.xhm(), margin=gap, unit="log-likelihood", low=gap is not None and gap < 2.0,
                     alternatives=[f"{g.xhm()} ({sc - sgs[0][1]:+.1f})" for g, sc in sgs[1:4]])
         self.log(f"  SCALE: selected {best.bravais} point group {best.point_group} -> space group {sg.xhm()} (#{sg.number})")
-        return best, sg
+        return sg
+
+    def _redecide_point_group(self, obs, s, refl):
+        """A close point-group call of an earlier SCALE run decided again on this run's data (re-integrated).
+
+        Pass 1 decides on the first integration. On crowded data that one may use the default spot widths (no
+        isolated strong spots), so neighbours leak into each other's profiles: the mixed-in intensity of unrelated
+        reflections narrows the intensity distribution, which the L-test reads as twinning, and lowers the CC of
+        true symmetry mates; with the twin path open, true elements then compete as twin laws and the posterior
+        spreads over subgroups. The re-integration (per-block widths, forward model) removes the leak, but the group
+        was never revisited. So when the earlier run's call is the scorer's (a user group the lattice allows is never
+        re-decided) and a close one (posterior < 0.9, the record's low-margin flag that also triggers the decision
+        audit), and no reindexing was given, the same scorer runs on obs, in the primitive basis of the indexing
+        cell, and its call replaces the earlier one: the later data are the better data, and no threshold of its own
+        is involved. A call made here is not decided again (one re-decision per pass-1 call, also when a SCALE-only
+        run is followed by a second pass). obs are this run's selected observations as integrated, the kind of input
+        of the pass-1 call: scaling, its error model and outlier rejection fit the mates of the current group, so
+        their output carries the hypothesis under test (misfits of a too-high group rejected, the decay of a
+        pseudo-symmetry element scaled away, sigmas inflated past the scorer's I/sigma cut).
+
+        Same rotation group: nothing changes (one log line). Another group of the lattice: the space group from the
+        absences, the point-group and space-group records and the audit alternatives are replaced, the observations
+        (refl) and the crystal are reindexed through the primitive basis to its conventional setting (cell
+        constraints of its system), and the results derived in the old setting are dropped. Returns True: the caller
+        then selects, refines and scales in the new group."""
+        st, p = self.st, self.p
+        rec = next((d for d in st.results.get("decisions", []) if d["name"] == "point group"), None)
+        if rec is None or not rec.get("low_margin") or rec.get("note") or p.reidx is not None or st.indexing is None:
+            return False
+        sg0 = st.space_group
+        # current indices -> the indexing cell: h_red = T h, exact on the reflections the centring allows (fractions
+        # 1/n between centred and primitive settings). Without a reference data set the indices are h_red P, P of
+        # the lattice applied (pass 1, or here on a rerun); a reference reindexing is covered by solving against the
+        # indexing crystal (tolerance ~1 deg of orientation change on long cells)
+        M = np.linalg.inv(np.asarray(st.lattice.P, float)).T if not p.reference_data_set else \
+            np.linalg.solve(st.indexing.exp.crystal.Astar, st.exp.crystal.Astar)
+        T = centring_reindex(M, sg0)
+        hr = None if T is None else refl["hkl"] @ np.asarray(T, float).T
+        if hr is None or np.abs(hr - np.rint(hr)).max() > 1e-6:
+            if p.space_group_number <= 0:       # (a user group may be the one in use: then silent)
+                self.log("  SCALE: point group not re-decided (no index transformation to the indexing cell)")
+            return False
+        Ast_red = st.exp.crystal.Astar @ np.linalg.inv(T)
+        cands = lattice_candidates(cell_from_Astar(Ast_red), max_obliq=p.lattice_tolerance)
+        if self._user_group_match(cands):
+            return False
+        r_red = dict(obs, hkl=apply_rot(obs["hkl"], np.asarray(T).T))
+        buf = []
+        best, chosen, scores, opsc, cc_true, extra = self._score_point_group(r_red, cands, s, buf.append)
+        now = [R for R in rot_matrices(sg0) if round(np.linalg.det(R)) == 1]
+        if _rotations_in_basis(best.P, best.ops) == _rotations_in_basis(np.linalg.inv(T).T, now):
+            self.log(f"  SCALE: point group {rec['choice']} kept: the re-integrated data give the same group "
+                     f"(posterior {chosen.prob:.2f} on them, {rec['margin']:.2f} in the earlier call)")
+            return False
+        for line in buf:
+            self.log(line)
+        for k in ("symmetry_ice_bands", "symmetry_alternative", "tncs_modulation"):
+            st.results.pop(k, None)
+        st.results.update(extra)
+        sg = self._space_group_and_decisions(r_red, best, chosen, scores, opsc, cc_true, Ast_red,
+                                             note=f"re-decided on the re-integrated data (earlier call {rec['choice']}, "
+                                                  f"posterior {rec['margin']:.2f})")
+        refl["hkl"] = apply_rot(refl["hkl"], np.asarray(T).T)
+        st.exp = Experiment(st.exp.geom.copy(), Crystal.from_Astar(Ast_red, "a"))
+        self._apply_lattice(best, sg, refl)
+        # derived in the old setting: reference reindexing, cell along the sweep (its axes), repeats vs symmetry mates;
+        # the rest of this run decides them anew. Decision records stay (each replaced when this run decides it, as
+        # from pass 1 to pass 2): every record is then the latest decision event of its name (PDF, dashboard)
+        for k in ("reference_applied", "cell_trajectory", "cell_step", "repeat_symmetry_cc", "shared_error_worst"):
+            st.results.pop(k, None)
+        self.log(f"  SCALE: observations and crystal reindexed from {sg0.xhm()} to {sg.xhm()} (cell "
+                 f"{np.array2string(st.exp.crystal.cell, precision=3)}); observations selected again in the new "
+                 f"point group")
+        return True
+
+    def _write_subgroup_files(self, exp, r, act, I, sig):
+        """Hidden-twin subgroups of this run (self._hidden_twin) in a reference setting: the observations act of r
+        (same axes and indices; I, sig as scaled) in the subgroup, xpg_unmerged_<symbol>.mtz, input for MR / twin
+        refinement. Subgroup files of an earlier SCALE run not written by this one are removed (SUBGROUP_FILES
+        names only): after the point group was decided again they are in another setting, and xpg mr would merge
+        this run's indices in their groups as they stand."""
+        subs = [(t[0], f"xpg_unmerged_{t[0].xhm().replace(' ', '')}.mtz")
+                for t in (getattr(self, "_hidden_twin", None) or []) if t[0].is_reference_setting()]
+        old = {f.name for f in Path(self.wd).glob("xpg_unmerged_*.mtz")} & SUBGROUP_FILES
+        _remove_outputs(self.wd, old - {fn for _, fn in subs}, self.log)
+        for sub, fn in subs:
+            self._write_unmerged(self.wd / fn, exp, sub, r["hkl"][act], I[act], sig[act], r["x"][act], r["y"][act],
+                                 r["z"][act], r["rlp"][act], geometry=False)
+            self.log(f"  TWINNING: data in {sub.xhm()} written to {fn}")
 
     def _write_merged(self, merged, cell, sg, dcut, wavelength, final):
         aniso = write_merged_outputs(merged, cell, sg, dcut, wavelength, self.wd / "xpg", log=self.log,
                                      anisotropy=self.anisotropy, free_r_reference=self.p.free_r_reference)
+        if not aniso:       # (off or failed: an earlier run's anisotropic data, maybe in another setting, go too)
+            _remove_outputs(self.wd, ["xpg_anisotropic.mtz"], self.log)
         tw = self.st.results.get("twinning")
-        if tw is not None and tw.twin_laws:
-            op, h, a, n, ab = max(tw.twin_laws, key=lambda t: t[2])
-            if 0.05 < a < 0.4:
-                from .analysis import detwin
-                Id, sd, ok = detwin(merged["hkl"], merged["I"], merged["sig"], sg, op, a)
-                md = dict(merged)
-                md["I"], md["sig"] = np.where(ok, Id, merged["I"]), np.where(ok, sd, merged["sig"])
-                for k in ("Iplus", "Iminus"):
-                    md[k] = np.full(len(Id), np.nan)
-                    md["sig" + k] = np.full(len(Id), np.nan)
-                write_merged_outputs(md, cell, sg, dcut, wavelength, self.wd / "xpg_detwinned", log=self.log,
-                                     anisotropy=False)
-                self.log(f"  TWINNING: twin law {op}, alpha {a:.3f} (H-test) / {ab:.3f} (Britton): detwinned data "
-                         f"written to xpg_detwinned_merged_iso.mtz (prefer twin refinement for alpha > 0.3)")
+        law = max(tw.twin_laws, key=lambda t: t[2]) if tw is not None and tw.twin_laws else None
+        # detwinned data of an earlier SCALE run (another twin law, fraction or setting) not written by this one are
+        # removed: write_merged_outputs' files of the stem (the isotropic one only, rewritten when detwinned)
+        detw = law is not None and 0.05 < law[2] < 0.4
+        _remove_outputs(self.wd, ["xpg_detwinned_anisotropic.mtz"] + ([] if detw else ["xpg_detwinned_merged_iso.mtz"]),
+                        self.log)
+        if detw:
+            op, h, a, n, ab = law
+            from .analysis import detwin
+            Id, sd, ok = detwin(merged["hkl"], merged["I"], merged["sig"], sg, op, a)
+            md = dict(merged)
+            md["I"], md["sig"] = np.where(ok, Id, merged["I"]), np.where(ok, sd, merged["sig"])
+            for k in ("Iplus", "Iminus"):
+                md[k] = np.full(len(Id), np.nan)
+                md["sig" + k] = np.full(len(Id), np.nan)
+            write_merged_outputs(md, cell, sg, dcut, wavelength, self.wd / "xpg_detwinned", log=self.log,
+                                 anisotropy=False)
+            self.log(f"  TWINNING: twin law {op}, alpha {a:.3f} (H-test) / {ab:.3f} (Britton): detwinned data "
+                     f"written to xpg_detwinned_merged_iso.mtz (prefer twin refinement for alpha > 0.3)")
         if aniso:
             self._aniso_inside = aniso.pop("inside_hkl")
             self.st.results["aniso"] = aniso
