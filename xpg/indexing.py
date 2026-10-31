@@ -789,6 +789,7 @@ def search_extra_lattices_fn(exp, spots, final_ok, dmin_index, max_cell, max_err
     ok_w = final_ok & (spots.intensity >= np.median(spots.intensity[final_ok])) if final_ok.any() else final_ok
     w_rot = (float(np.median(spots.zmax[ok_w] - spots.zmin[ok_w] + 1)) * abs(exp.geom.osc)
              if ok_w.sum() >= 20 else np.inf)
+    bounded = None
     for k in range(max_extra_lattices + 6):
         if len(extra) >= max_extra_lattices:
             break
@@ -796,7 +797,7 @@ def search_extra_lattices_fn(exp, spots, final_ok, dmin_index, max_cell, max_err
         if rest_idx.size < max(200, 0.05 * len(spots)):
             break
         try:
-            sub = index_spots(exp.geom, spots.subset(rest_idx), dmin_index, max_cell,
+            sub = index_spots(exp.geom, spots.subset(rest_idx), dmin_index, max_cell if bounded is None else bounded,
                               refine_flags=["ORIENTATION", "CELL"], verbose=False, search_extra_lattices=False,
                               beam_search=False, max_err_xy=max_err_xy, max_err_phi=max_err_phi, n_fft=n_fft)
         except Exception:
@@ -828,6 +829,18 @@ def search_extra_lattices_fn(exp, spots, final_ok, dmin_index, max_cell, max_err
         if not strong:
             break
         if not same_cell:
+            # never above the max cell of the rejected search (the user's max_cell, or the capped estimate)
+            lim = float(getattr(sub, "max_cell", None) or max_cell or np.inf)
+            if bounded is None and 2.5 * float(max(c_main[:3])) < 0.95 * lim:
+                # ice and noise among the remaining spots inflate the max-cell estimate, and the FFT then finds a large
+                # foreign cell; only the main crystal form is accepted, so the search is repeated with the max cell
+                # bounded by the main cell (a data set with three further crystals of the same form was missed)
+                bounded = 2.5 * float(max(c_main[:3]))
+                if verbose:
+                    log(f"  INDEX: candidate extra lattice with cell {np.array2string(c_sub, precision=1)} rejected "
+                        f"(different from the main reduced cell); searching again with the max cell bounded by the "
+                        f"main cell ({bounded:.0f} A)")
+                continue
             if verbose:
                 log(f"  INDEX: candidate extra lattice with cell {np.array2string(c_sub, precision=1)} rejected "
                     f"(different from the main reduced cell)")
@@ -851,7 +864,7 @@ def search_extra_lattices_fn(exp, spots, final_ok, dmin_index, max_cell, max_err
         claimed |= full
         if verbose:
             rot = _misorientation_sym(exp.crystal, sub.exp.crystal)
-            log(f"  INDEX: lattice {k + 2} indexes {sub.indexed.sum()} of the remaining spots; cell "
+            log(f"  INDEX: lattice {len(extra) + 1} indexes {sub.indexed.sum()} of the remaining spots; cell "
                 f"{np.array2string(sub.exp.crystal.cell, precision=2)}; misorientation {rot:.2f} deg "
                 f"(spot rotation width {w_rot:.2f} deg)")
     return extra, domains

@@ -24,9 +24,10 @@ class TwinningReport:
     l2_mean: float               # <L^2> : 1/3 untwinned, 1/5 perfect twin
     twin_laws: list              # [(operator, <H>, alpha_H, n)]
     dmin_used: float
+    wilson_dmin: float = float("nan")   # high-resolution end of the Wilson fit
 
     def lines(self):
-        out = [f"  Wilson B = {self.wilson_b:.1f} A^2 (fit 4.5 A - {self.dmin_used:.2f} A)",
+        out = [f"  Wilson B = {self.wilson_b:.1f} A^2 (fit 4.5 A - {self.wilson_dmin:.2f} A)",
                f"  acentric <I^2>/<I>^2 = {self.i2_over_i_sq:.3f} (untwinned 2.0, perfect twin 1.5); "
                f"<|E^2-1|> = {self.mod_e2_minus_1:.3f} (0.736 / 0.541)",
                f"  L-test: <|L|> = {self.l_mean:.3f} (0.500 untwinned, 0.375 perfect twin), <L^2> = {self.l2_mean:.3f}"]
@@ -37,7 +38,22 @@ class TwinningReport:
         return out
 
 
-def twinning_analysis(hkl, I, sig, cell, sg, isig_min=0.0, tncs=None):
+# average amino-acid residue without hydrogens (they change the B of the sum f^2 fall-off by < 0.1 A^2)
+_PROTEIN_ATOMS = (("C", 4.94), ("N", 1.36), ("O", 1.48), ("S", 0.04))
+
+
+def protein_sum_f2(s2):
+    """Sum of squared atomic scattering factors (IT92 Gaussians) of an average residue at s^2 = 1/d^2."""
+    stol2 = 0.25 * np.asarray(s2, float)
+    tot = np.zeros_like(stol2)
+    for el, n in _PROTEIN_ATOMS:
+        c = gemmi.Element(el).it92
+        f = c.c + sum(a * np.exp(-b * stol2) for a, b in zip(c.a, c.b))
+        tot += n * f * f
+    return tot
+
+
+def twinning_analysis(hkl, I, sig, cell, sg, isig_min=0.0, tncs=None, dmin=None):
     sg = as_spacegroup(sg)
     d = d_spacing(hkl, cell)
     centric, eps, absent = reflection_props(hkl, sg)
@@ -53,15 +69,18 @@ def twinning_analysis(hkl, I, sig, cell, sg, isig_min=0.0, tncs=None):
             dmin_use = 1 / np.sqrt(edges[i])
             break
     use = ok & (d >= dmin_use)
-    # Wilson B from ln(<I/eps>) vs s^2 in 4.5 A .. dmin
-    wb = use & (d <= 4.5)
+    # Wilson B from ln(<I/eps> / <sum f^2>) vs s^2 in 4.5 A .. the resolution limit dmin (else the <I/sigma> = 3
+    # limit above). Without sum f^2 the form-factor fall-off adds 6-11 A^2; a fit ending near 3 A is too short to
+    # average out the ripple of protein Wilson plots (maximum near 4 A, minimum near 2.7 A): 10 A^2 or more
+    dmin_w = dmin if dmin else dmin_use
+    wb = ok & (d <= 4.5) & (d >= dmin_w)
     wilson_b = np.nan
     if wb.sum() > 100:
         e2 = np.quantile(s2[wb], np.linspace(0, 1, 11))
         xs, ys = [], []
         for i in range(10):
             b = wb & (s2 >= e2[i]) & (s2 < e2[i + 1])
-            m = np.mean(I[b] / eps[b])
+            m = np.mean(I[b] / eps[b]) / np.mean(protein_sum_f2(s2[b]))
             if m > 0:
                 xs.append(np.mean(s2[b]))
                 ys.append(np.log(m))
@@ -140,7 +159,8 @@ def twinning_analysis(hkl, I, sig, cell, sg, isig_min=0.0, tncs=None):
         hm = float(np.mean(H))
         ab, _ = britton_alpha(i1[good], i2_[good], sig[ac][m][good], sig[j[m]][good])
         laws.append((op.triplet(), hm, max(0.0, 0.5 - hm), int(good.sum()), ab))
-    return TwinningReport(float(wilson_b), i2, me, float(np.mean(np.abs(L))), float(np.mean(L ** 2)), laws, float(dmin_use))
+    return TwinningReport(float(wilson_b), i2, me, float(np.mean(np.abs(L))), float(np.mean(L ** 2)), laws, float(dmin_use),
+                          float(dmin_w))
 
 
 def l_test_alpha(l_mean):

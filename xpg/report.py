@@ -10,7 +10,7 @@ import time
 
 import numpy as np
 
-OUTPUTS = [("xpg_merged_iso.mtz", "merged, French-Wilson amplitudes, isotropic CC1/2 cut-off"),
+OUTPUTS = [("xpg_merged_iso.mtz", "merged, French-Wilson amplitudes, isotropic resolution cut-off"),
            ("xpg_anisotropic.mtz", "merged, anisotropic cut-off and anisotropic-prior French-Wilson"),
            ("xpg_unmerged.mtz", "unmerged scaled intensities"),
            ("xpg_geometry.json", "refined experimental geometry and crystal model"),
@@ -116,17 +116,33 @@ def build_markdown(pipe) -> str:
         L += ["- No frames excluded by the image-group filter"]
     if p.exclude_data_range:
         L += ["- Frames excluded by the input (EXCLUDE_DATA_RANGE): " + ", ".join(f"{a}-{b}" for a, b in p.exclude_data_range)]
-    rings = r.get("ice_rings_excluded")
+    rings = r.get("ice_rings_excluded") or []
+    excl = {(float(a), float(b)) for a, b in rings}
+    kept = [(a, b) for a, b in (r.get("ice_rings") or []) if (float(a), float(b)) not in excl]
+    bands = lambda rr: ", ".join(f"{max(a, b):.2f}-{min(a, b):.2f} A" for a, b in rr)
     if rings:
-        L += ["- Ice-ring shells excluded: " + ", ".join(f"{max(a, b):.2f}-{min(a, b):.2f} A" for a, b in rings)]
-    elif r.get("ice_rings"):
-        L += ["- Ice rings detected but kept (not worse than ice-free shells)"]
+        L += ["- Ice-ring shells excluded: " + bands(rings) +
+              (f"; detected but kept (not worse than ice-free shells): {bands(kept)}" if kept else "")]
+    elif kept:
+        L += [f"- Ice rings detected but kept (not worse than ice-free shells): {bands(kept)}"]
 
     # quality
     L += ["", "## Data quality", ""]
     L += [f"- ISa {_f(r.get('isa_two_param', r.get('isa')), '.1f')} (two-parameter a, b error model); empirical (strong-reflection "
           f"scatter) {_f(r.get('isa_empirical'), '.1f')}"]
-    L += [f"- Resolution where CC1/2 = 0.3: {_f(r.get('cc_half_cutoff'), '.2f')} A"]
+    fit, cl = r.get("cc_half_fit"), r.get("completeness_limit")
+    fit_txt = f"the CC1/2 = 0.3 fit is at {fit:.2f} A" if fit else "no CC1/2 = 0.3 fit"
+    if cl:
+        L += [f"- Resolution limit: {_f(r.get('cc_half_cutoff'), '.2f')} A, limited by completeness (thin shells beyond "
+              f"it are below {100 * cl['fraction']:g}% of the {100 * cl['plateau']:.1f}% completeness at low resolution"
+              + (f", d >= {cl['d_plateau']:.2f} A, the inner half of the shells" if cl.get("d_plateau") else
+                 f", d >= {cl['d_inscribed']:.2f} A" if cl.get("d_inscribed") else "") + f"; {fit_txt}; the data "
+              f"beyond the limit are in xpg_unmerged.mtz)"]
+    elif fit is not None and fit != r.get("cc_half_cutoff"):
+        L += [f"- Resolution limit: {_f(r.get('cc_half_cutoff'), '.2f')} A, limited by the data (the CC1/2 = 0.3 fit, "
+              f"{fit:.2f} A, lies outside the reflections kept)"]
+    else:
+        L += [f"- Resolution where CC1/2 = 0.3: {_f(r.get('cc_half_cutoff'), '.2f')} A"]
     an = r.get("aniso")
     if an and an.get("limits"):
         dirs = an.get("directions_hkl") or []
@@ -154,33 +170,46 @@ def build_markdown(pipe) -> str:
         cut = r.get("shells_cut") is not None and r.get("overall_cut") is not None
         shells_s, ov_s = (r["shells_cut"], r["overall_cut"]) if cut else (shells, ov)
         inner, outer = shells_s[0], shells_s[-1]
-        rows = [("Resolution (A)", lambda s: f"{s.dmax:.2f}-{s.dmin:.2f}"), ("N obs", lambda s: f"{int(s.n_obs)}"),
-                ("N unique", lambda s: f"{int(s.n_uniq)}"),
-                ("Completeness %", lambda s: _f(100 * s.completeness if s.completeness <= 1.0 else s.completeness, '.1f')),
-                ("Multiplicity", lambda s: _f(s.multiplicity, '.1f')), ("I/sigma", lambda s: _f(s.i_over_sigma, '.1f')),
-                ("Rmeas", lambda s: _f(s.rmeas, '.3f')), ("Rpim", lambda s: _f(s.rpim, '.3f')),
-                ("CC1/2", lambda s: _f(s.cc_half, '.3f')), ("CCano", lambda s: _f(s.cc_ano, '.3f'))]
+        lim = ("the completeness limit" if cl else
+               "the edge of the data" if fit is not None and fit != r.get("cc_half_cutoff") else "the CC1/2 = 0.3 limit")
+        # Table 1: the per-shell rows, and the data-set rows (one value, in the overall column)
+        rows = [("Resolution (A)", lambda s: f"{s.dmax:.2f}-{s.dmin:.2f}"),
+                ("Total observations", lambda s: f"{int(s.n_obs)}"), ("Unique reflections", lambda s: f"{int(s.n_uniq)}"),
+                ("Multiplicity", lambda s: _f(s.multiplicity, '.1f')),
+                ("Completeness %", lambda s: _f(100 * s.completeness, '.1f')),
+                ("Mean I/sigma(I)", lambda s: _f(s.i_over_sigma, '.1f')), ("Wilson B (A^2)", None),
+                ("Rmerge", lambda s: _f(s.rmerge, '.3f')), ("Rmeas", lambda s: _f(s.rmeas, '.3f')),
+                ("Rpim", lambda s: _f(s.rpim, '.3f')), ("CC1/2", lambda s: _f(s.cc_half, '.3f')),
+                ("CCano", lambda s: _f(s.cc_ano, '.3f'))]
+        once = {"Wavelength (A)": f"{g.wavelength:.4f}", "Space group": sg,
+                "Unit cell (A, deg)": " ".join(f"{c:.2f}" for c in cell[:3]) + ", " + " ".join(f"{c:.1f}" for c in cell[3:]),
+                "Wilson B (A^2)": _f(tw.wilson_b, '.1f') if tw is not None else "-"}
         # the anisotropic data (inside the cut-off surface, xpg_anisotropic.mtz) next to the isotropic ones
         an = r.get("shells_aniso") and r.get("overall_aniso") is not None
         cols = [ov_s, inner, outer] + ([r["overall_aniso"], r["shells_aniso"][0], r["shells_aniso"][-1]] if an else [])
         head = "| | overall | inner shell | outer shell |" + (" aniso overall | aniso inner | aniso outer |" if an else "")
-        L += ["", "Summary" + (" (isotropic: to the CC1/2 = 0.3 limit" if cut else " (isotropic: all data") +
+        L += ["", "Summary" + (f" (isotropic: to {lim}" if cut else " (isotropic: all data") +
               ("; anisotropic: inside the cut-off surface, xpg_anisotropic.mtz)" if an else ")") + ":", "",
               head, "|---" * (len(cols) + 1) + "|"]
+        for name in ("Wavelength (A)", "Space group", "Unit cell (A, deg)"):
+            L += [f"| {name} | {once[name]} |" + " |" * (len(cols) - 1)]
         for name, fn in rows:
+            if fn is None:
+                L += [f"| {name} | {once[name]} |" + " |" * (len(cols) - 1)]
+                continue
             L += ["| " + name + " | " + " | ".join(fn(c) for c in cols) + " |"]
         if an and r.get("ellipsoidal_completeness") is not None:
             L += ["| Ellipsoidal completeness % | | | | " + _f(100 * r["ellipsoidal_completeness"], '.1f') + " | | |"]
         # per shell: to the limit, as in xpg_merged_iso.mtz and the PDF, with the same overall row; the shells beyond
         # it (in xpg_unmerged.mtz only) separately, without an overall row of their own
-        head_s = ["| Resolution (A) | N obs | N uniq | Compl % | Mult | I/sigma | Rmeas | Rpim | CC1/2 | CCano |",
-                  "|---|---|---|---|---|---|---|---|---|---|"]
+        head_s = ["| Resolution (A) | N obs | N uniq | Compl % | Mult | I/sigma | Rmerge | Rmeas | Rpim | CC1/2 | CCano |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|"]
 
         def row(s, lab):
-            return (f"| {lab} | {int(s.n_obs)} | {int(s.n_uniq)} | {_f(100 * s.completeness if s.completeness <= 1.0 else s.completeness, '.1f')} | {_f(s.multiplicity, '.1f')} "
-                    f"| {_f(s.i_over_sigma, '.1f')} | {_f(s.rmeas, '.3f')} | {_f(s.rpim, '.3f')} | {_f(s.cc_half, '.3f')} "
-                    f"| {_f(s.cc_ano, '.3f')} |")
-        L += ["", "Shells " + ("to the CC1/2 = 0.3 limit (xpg_merged_iso.mtz):" if cut else "(all data):"), ""] + head_s
+            return (f"| {lab} | {int(s.n_obs)} | {int(s.n_uniq)} | {_f(100 * s.completeness, '.1f')} | {_f(s.multiplicity, '.1f')} "
+                    f"| {_f(s.i_over_sigma, '.1f')} | {_f(s.rmerge, '.3f')} | {_f(s.rmeas, '.3f')} | {_f(s.rpim, '.3f')} "
+                    f"| {_f(s.cc_half, '.3f')} | {_f(s.cc_ano, '.3f')} |")
+        L += ["", "Shells " + (f"to {lim} (xpg_merged_iso.mtz):" if cut else "(all data):"), ""] + head_s
         L += [row(s, f"{s.dmax:.2f}-{s.dmin:.2f}") for s in shells_s]
         L += [row(ov_s, f"**overall {ov_s.dmax:.2f}-{ov_s.dmin:.2f}**")]
         beyond = [s for s in shells if cut and 0.5 * (s.dmax + s.dmin) < ov_s.dmin]

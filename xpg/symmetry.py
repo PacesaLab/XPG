@@ -32,6 +32,7 @@ class OpScore:
     ratio_lo: float = float("nan")  # CC / expected CC in the low- and high-resolution halves (NCS test)
     ratio_hi: float = float("nan")
     twin_cc: float = float("nan")   # lowest CC a twin law predicts (twin fraction >= the L-test's lower bound)
+    cc_exp: float = float("nan")    # expected CC if the element is true symmetry (matched to its pairs' separations)
 
 
 @dataclass
@@ -143,9 +144,180 @@ def _pseudo_symmetry(cc, cc_true, alpha_L, Em, ii, jj, s_u, s_med, cc_true_half,
     return ""
 
 
+def _sym_cc(x, y):
+    """CC of the pairs (x, y) taken in both orders (repeats have no first and second observation)."""
+    return np.corrcoef(np.r_[x, y], np.r_[y, x])[0, 1]
+
+
+def _pairs_within(cnt, start, cap=2_000_000):
+    """Pairs of observations (a < b) of the same merged reflection, as positions in the merged-order arrays; at most
+    ~cap pairs (every k-th reflection)."""
+    stride = max(1, -(-int(np.sum(cnt * (cnt - 1) // 2)) // cap))
+    A, B = [], []
+    for m in np.unique(cnt[cnt >= 2]):
+        r = np.flatnonzero(cnt == m)[::stride]
+        ta, tb = np.triu_indices(m, 1)
+        A.append((start[r][:, None] + ta).ravel())
+        B.append((start[r][:, None] + tb).ravel())
+    if not A:
+        return np.zeros(0, int), np.zeros(0, int)
+    return np.concatenate(A), np.concatenate(B)
+
+
+def _pairs_between(cnt, start, ii, jj, cap=1_000_000):
+    """Pairs of observations (one of merged reflection i, one of j) for the merged pairs (ii, jj), as positions in the
+    merged-order arrays, with weight 1 / (n_i n_j) (every merged pair counts once); at most ~cap pairs (every k-th
+    merged pair). Returns a, b, weight and the merged pairs used."""
+    stride = max(1, -(-int(np.sum(cnt[ii] * cnt[jj])) // cap))
+    ii, jj = ii[::stride], jj[::stride]
+    ni, nj = cnt[ii], cnt[jj]
+    k = ni * nj
+    p = np.repeat(np.arange(ii.size), k)
+    q = np.arange(p.size) - np.repeat(np.cumsum(k) - k, k)
+    return start[ii][p] + q // nj[p], start[jj][p] + q % nj[p], 1.0 / k[p], ii, jj
+
+
+def _separation_decay(E2s, phs, s_obs, A, B, nshell=4):
+    """CC of repeated measurements of the same reflection as a function of their rotation separation |dphi| and
+    resolution: systematic errors that vary along the sweep (damage, absorption, scale drift not removed by the
+    per-block normalisation) are shared by repeats measured close in phi and not by symmetry mates measured far apart.
+    The CC of the repeat pairs (A, B; positions in the merged-order arrays) in each (resolution shell, separation bin)
+    cell, with jackknife errors (E^2 is far from normal: the normal-theory error is several times too small), is
+    smoothed towards the additive model log CC = level(shell) + log D(bin) by empirical-Bayes shrinkage: the shells
+    absorb the fall of the CC with resolution (noise), which would otherwise pass for decay (the separation of
+    Friedel mates grows with the diffraction angle), and the shrunk interaction keeps a decay that is stronger at
+    high resolution (damage). Cells without repeats take the additive model plus the interaction of their shell's
+    nearest cell; separations beyond all repeats hold the value at the nearest smaller separation (no extrapolated
+    decay: too high an expected CC only errs towards the lower symmetry). Returns the model (shell edges,
+    single-observation CC per cell, E^2 variance per shell), or None when the CC falls significantly with
+    separation in no shell (trend > SEP_DECAY_Z standard errors and > SEP_MIN_DECAY over the separations measured),
+    and a summary for the log."""
+    nb = SEP_EDGES.size - 1
+    b = np.clip(np.searchsorted(SEP_EDGES, np.abs(phs[A] - phs[B]), "right") - 1, 0, nb - 1)
+    q = np.quantile(s_obs[A], np.linspace(0, 1, nshell + 1))
+    k = np.clip(np.searchsorted(q, s_obs[A], "right") - 1, 0, nshell - 1)
+    cells = []
+    for kk in range(nshell):
+        for bb in range(nb):
+            m = (k == kk) & (b == bb)
+            n = int(m.sum())
+            if n < SEP_MIN_PAIRS:
+                continue
+            x, y = E2s[A[m]], E2s[B[m]]
+            r = _sym_cc(x, y)
+            if np.isfinite(r) and r > 0.05:
+                g = np.arange(n) % 10                # delete-a-group jackknife
+                rj = np.array([_sym_cc(x[g != i], y[g != i]) for i in range(10)])
+                cells.append((kk, bb, np.log(r), max(0.9 * np.sum((rj - rj.mean()) ** 2), 1e-12) / r ** 2,
+                              max((1 - r * r) ** 2, 1e-12) / (n * r * r)))
+    bins, shells = sorted({c[1] for c in cells}), sorted({c[0] for c in cells})
+    if len(bins) < 2:
+        return None, None
+    ck, cb = np.array([c[0] for c in cells]), np.array([c[1] for c in cells])
+    y, v = np.array([c[2] for c in cells]), np.array([c[3] for c in cells])
+    X = np.zeros((len(cells), len(shells) + len(bins) - 1))
+    X[np.arange(len(cells)), [shells.index(kk) for kk in ck]] = 1.0
+    for i, bb in enumerate(cb):
+        if bins.index(bb) > 0:
+            X[i, len(shells) + bins.index(bb) - 1] = 1.0
+    if np.linalg.matrix_rank(X) < X.shape[1]:       # separation bins not linked across resolution shells
+        return None, None
+    sw = 1 / np.sqrt(v)
+    beta = np.linalg.lstsq(X * sw[:, None], y * sw, rcond=None)[0]
+    ns = len(shells)
+    lev = np.interp(np.arange(nshell), shells, beta[:ns])
+    ld = np.full(nb, np.nan)
+    ld[bins] = np.r_[0.0, beta[ns:]]
+    for i in range(nb):
+        if not np.isfinite(ld[i]):
+            ld[i] = ld[i - 1] if i > 0 else ld[bins[0]]
+    L = lev[:, None] + ld[None]                     # additive model, log CC per (shell, bin)
+    res = y - L[ck, cb]
+    tau2 = max(0.0, float(np.mean(res ** 2 - v)))   # interaction variance (method of moments)
+    inter = np.full((nshell, nb), np.nan)
+    inter[ck, cb] = res * tau2 / (tau2 + v)
+    for kk in range(nshell):                        # cells without repeats carry their shell's nearest interaction
+        row = inter[kk]
+        if np.isfinite(row).any():
+            f = np.flatnonzero(np.isfinite(row))
+            row[:f[0]] = row[f[0]]
+            for i in range(f[0] + 1, nb):
+                if not np.isfinite(row[i]):
+                    row[i] = row[i - 1]
+    L += np.nan_to_num(inter)
+    # decay test: linear trend of log CC with separation in each shell (damage decorrelates high resolution first),
+    # errors inflated by the scatter of the cells about the better-fitting of the trends and the additive model (the
+    # jackknife errors of single cells are noisy themselves; the trends miss a decay that sets in late, the additive
+    # model one that differs between shells); a single deviant cell, or a CC that rises with separation, is not decay.
+    # A 10-group jackknife variance is itself chi2-like (~9 df) and can be several times too small, so that one cell
+    # set a shell's trend on data without drift: for the test it is floored at the normal-theory variance of log CC,
+    # (1 - r^2)^2 / (n r^2), times the shell's median jackknife inflation of it (skewed E^2, simulated: ~2x at any
+    # CC); a floor, not a replacement (outliers make some cells' variance genuinely far larger, real data: 10-100x).
+    # The model above keeps the jackknife weights.
+    vnt = np.array([c[4] for c in cells])
+    vt = v.copy()
+    for kk in shells:
+        mk = ck == kk
+        vt[mk] = np.maximum(v[mk], np.median(v[mk] / vnt[mk]) * vnt[mk])
+    swt = 1 / np.sqrt(vt)
+    xb = 0.5 * (SEP_EDGES[:-1] + np.minimum(SEP_EDGES[1:], 360.0)) / 100.0
+    Xt = np.c_[X[:, :ns], X[:, :ns] * xb[cb][:, None]]
+    bt = np.linalg.lstsq(Xt * swt[:, None], y * swt, rcond=None)[0]
+    disp = max(1.0, min(float(np.sum((M @ np.linalg.lstsq(M * swt[:, None], y * swt, rcond=None)[0] - y) ** 2 / vt))
+                        / max(len(cells) - M.shape[1], 1) for M in (X, Xt)))
+    se = np.sqrt(np.diag(np.linalg.pinv((Xt / vt[:, None]).T @ Xt))[ns:] * disp)
+    span = np.array([np.ptp(xb[cb[ck == kk]]) for kk in shells])
+    z = -bt[ns:] / np.maximum(se, 1e-12)
+    drop = 1 - np.exp(bt[ns:] * span)
+    summ = dict(bins=bins, D=np.exp(ld[bins] - ld[bins].max()), z=z, drop=drop)
+    if not np.any((z > SEP_DECAY_Z) & (drop > SEP_MIN_DECAY)):
+        return None, summ
+    ks = np.clip(np.searchsorted(q, s_obs, "right") - 1, 0, nshell - 1)
+    var = np.array([E2s[ks == i].var() if np.any(ks == i) else 1.0 for i in range(nshell)])
+    return dict(q=q, rho=np.minimum(np.exp(L), 0.999), var=var), summ
+
+
+def _rho(model, phs, s_obs, A, B):
+    """CC of two single observations (positions A, B) of the same intensity predicted by the separation model, and
+    the single-observation E^2 variance of their resolution shell."""
+    b = np.clip(np.searchsorted(SEP_EDGES, np.abs(phs[A] - phs[B]), "right") - 1, 0, SEP_EDGES.size - 2)
+    k = np.clip(np.searchsorted(model["q"], s_obs[A], "right") - 1, 0, model["var"].size - 1)
+    return model["rho"][k, b], model["var"][k]
+
+
+def _within_agreement(model, phs, s_obs, ref_obs, cnt, start, A, B):
+    """Per merged reflection: variance of its mean E^2 in the separation model, var_k (1/n + 2 sum_{a<b} rho_ab / n^2)
+    (repeat pairs A, B; reflections whose pairs were not sampled take the mean pair CC of their multiplicity)."""
+    rho, _ = _rho(model, phs, s_obs, A, B)
+    ssum = np.bincount(ref_obs[A], rho, cnt.size)
+    npair = np.bincount(ref_obs[A], minlength=cnt.size)
+    miss = (npair == 0) & (cnt > 1)
+    for m in np.unique(cnt[miss]):
+        sel = (cnt == m) & (npair > 0)
+        ssum[miss & (cnt == m)] = ssum[sel].sum() / max(npair[sel].sum(), 1) * m * (m - 1) / 2
+    k = np.clip(np.searchsorted(model["q"], s_obs[start], "right") - 1, 0, model["var"].size - 1)
+    return model["var"][k] * (1 / np.maximum(cnt, 1) + 2 * ssum / np.maximum(cnt, 1) ** 2)
+
+
+def _expected_cc(model, phs, s_obs, cnt, start, var_m, ii, jj):
+    """CC of the merged values over the pairs (ii, jj) if they were measurements of the same intensities: covariance
+    = the separation model's CC at the separations and resolutions of the pairs' observations (times the shell's
+    single-observation variance), averaged per merged pair; variances of the merged values from the same model with
+    their multiplicities (var_m, _within_agreement), single observations included. Without decay this is the
+    Spearman-Brown extrapolation of the single-observation CC to the multiplicities of the pairs at hand."""
+    A, B, W, ii, jj = _pairs_between(cnt, start, ii, jj)
+    rho, var = _rho(model, phs, s_obs, A, B)
+    cov = np.sum(W * rho * var) / max(ii.size, 1)
+    return float(np.clip(cov / np.sqrt(max(var_m[ii].mean() * var_m[jj].mean(), 1e-12)), 0.05, 0.995))
+
+
 NCS_DECAY = 0.15       # relative drop of CC / expected CC from the low- to the high-resolution half that marks NCS
 L_SD = 0.015           # uncertainty of <|L|> as a twin-fraction measure (modelling, not counting statistics)
 L_UNTWINNED = 0.44     # <|L|> above which twin fractions > 0.1 are excluded (simulated: 0.441 at alpha 0.1)
+SEP_EDGES = np.array([0.0, 2.5, 5, 10, 15, 20, 30, 45, 60, 90, 135, 180, 270, 360, np.inf])   # |dphi| bins (deg)
+SEP_MIN_PAIRS = 30     # repeat pairs per (resolution shell, separation bin) cell of the separation-decay fit
+SEP_DECAY_Z = 4.0      # significance (standard errors) and size of the repeat-CC decay with separation that is
+SEP_MIN_DECAY = 0.01   # corrected for; below either, every element is compared with the one expected CC
 
 
 def score_symmetry(hkl_red, I, sig, s, phi, cands, isig_limit=6.0, verbose=True, log=print, seed=0):
@@ -155,7 +327,9 @@ def score_symmetry(hkl_red, I, sig, s, phi, cands, isig_limit=6.0, verbose=True,
     * CC on E^2 for each symmetry element; the null distribution (mean, sd) is obtained from the
       same number of resolution-matched pairs of *unrelated* reflections
     * expected CC for a true symmetry element = CC of repeated measurements of the same
-      reflection (half-set CC corrected with Spearman-Brown)
+      reflection (half-set CC corrected with Spearman-Brown), matched to the rotation separations and
+      multiplicities of the element's pairs when repeats lose correlation with separation (_separation_decay,
+      _expected_cc)
     * likelihoods with truncated Lorentzian distributions, combined
       over all elements present / absent in each candidate group
     """
@@ -221,6 +395,16 @@ def score_symmetry(hkl_red, I, sig, s, phi, cands, isig_limit=6.0, verbose=True,
         bb = both & hm
         ch = np.corrcoef(e1[bb], e2[bb])[0, 1] if bb.sum() > 20 else np.nan
         cc_true_half.append(float(np.clip(2 * ch / (1 + ch), 0.05, 0.995)) if np.isfinite(ch) else cc_true)
+    # repeats are mostly measured close in phi (Friedel mates, a few degrees apart), symmetry mates mostly far apart:
+    # when the repeats' agreement falls with their separation, each element's expected CC is built from the repeats'
+    # CC at the separations (and resolutions) of that element's own observation pairs (_expected_cc)
+    srt_o = np.argsort(inv, kind="stable")
+    start = np.r_[0, np.cumsum(cnt)[:-1]]
+    phs, E2s, s_obs = phi[use][srt_o], E2[srt_o], s_u[inv[srt_o]]
+    Ar, Br = _pairs_within(cnt, start)
+    sep_D, sep_fit = _separation_decay(E2s, phs, s_obs, Ar, Br) if Ar.size >= 4 * SEP_MIN_PAIRS else (None, None)
+    if sep_D is not None:
+        var_m = _within_agreement(sep_D, phs, s_obs, inv[srt_o], cnt, start, Ar, Br)
     sbins = np.clip(np.searchsorted(np.quantile(s_u, np.linspace(0, 1, 11)), s_u) - 1, 0, 9)
     allops = {}
     for c in cands:
@@ -249,8 +433,17 @@ def score_symmetry(hkl_red, I, sig, s, phi, cands, isig_limit=6.0, verbose=True,
             opscores[kb] = OpScore(R, order, np.nan, int(ii.size))
             continue
         cc = float(np.corrcoef(Em[ii], Em[jj])[0, 1])
+        cc_exp, cc_exp_half = cc_true, cc_true_half
+        # known limitation: cc_true (reflections with >= 2 observations, Spearman-Brown) sits above the model value,
+        # which counts the pairs' single observations too, on data with many of them, so the expectation steps down
+        # where the decay test opens; the test's floored variances keep false openings rare
+        if sep_D is not None:
+            cc_exp = _expected_cc(sep_D, phs, s_obs, cnt, start, var_m, ii, jj)
+            lo = s_u[ii] <= s_med
+            cc_exp_half = [_expected_cc(sep_D, phs, s_obs, cnt, start, var_m, ii[m], jj[m]) if m.sum() >= 30 else cc_
+                           for m, cc_ in ((lo, cc_true_half[0]), (~lo, cc_true_half[1]))]
         info = {}
-        pseudo = _pseudo_symmetry(cc, cc_true, alpha_L, Em, ii, jj, s_u, s_med, cc_true_half, info)
+        pseudo = _pseudo_symmetry(cc, cc_exp, alpha_L, Em, ii, jj, s_u, s_med, cc_exp_half, info)
         # null: same number of resolution-matched unrelated pairs (partner shuffled within bin)
         null = []
         for _ in range(20):
@@ -259,12 +452,12 @@ def score_symmetry(hkl_red, I, sig, s, phi, cands, isig_limit=6.0, verbose=True,
                 m = sbins[ii] == b
                 jr[m] = rng.permutation(jr[m])
             null.append(np.corrcoef(Em[ii], Em[jr])[0, 1])
-        o = OpScore(R, order, cc, int(ii.size))
+        o = OpScore(R, order, cc, int(ii.size), cc_exp=cc_exp)
         o.pseudo = pseudo
         o.ratio_lo, o.ratio_hi = info.get("ratio_lo", np.nan), info.get("ratio_hi", np.nan)
         if pseudo == "twin":
             a = alpha_lo
-            o.twin_cc = cc_true * 2 * a * (1 - a) / (a * a + (1 - a) ** 2)
+            o.twin_cc = cc_exp * 2 * a * (1 - a) / (a * a + (1 - a) ** 2)
         o.null_mean, o.null_sd = float(np.mean(null)), float(np.std(null) + 1e-6)
         o.z = (cc - o.null_mean) / o.null_sd
         opscores[kb] = o
@@ -273,7 +466,7 @@ def score_symmetry(hkl_red, I, sig, s, phi, cands, isig_limit=6.0, verbose=True,
         Pi = np.linalg.inv(c.P)
         inset = {np.round(c.P @ Rc @ Pi).astype(int).tobytes() for Rc in c.ops}
         sc = 0.0
-        cin, cout = [], []
+        cin, cout, rout = [], [], []
         for kb, o in opscores.items():
             if not np.isfinite(o.cc):
                 continue
@@ -288,28 +481,30 @@ def score_symmetry(hkl_red, I, sig, s, phi, cands, isig_limit=6.0, verbose=True,
                 # twin evidence (L-test twinned and this element's CC as a twin law of that fraction predicts):
                 # symmetry and twin law compete on equal terms; at a tie the lower symmetry is preferred (merging
                 # pseudo-equivalent reflections corrupts the data, too low a symmetry only lowers the multiplicity)
-                sc += _lorentz_logpdf(o.cc, cc_true, gam) + (np.log(0.5) if o.pseudo == "twin" else 0.0)
+                sc += _lorentz_logpdf(o.cc, o.cc_exp, gam) + (np.log(0.5) if o.pseudo == "twin" else 0.0)
                 cin.append(o.cc)
             elif o.pseudo == "twin":
                 # measurement noise biases <|L|> towards 'untwinned': the L-test gives a LOWER bound on the twin
                 # fraction, so a twin law predicts any CC between twin_cc (alpha = the bound) and the expected CC
                 # (alpha = 0.5): uniform there, mixed with the unrelated (null) hypothesis
-                hi = cc_true + gam
+                hi = o.cc_exp + gam
                 p_tw = 1.0 / max(hi - o.twin_cc, 1e-3) if o.twin_cc <= o.cc <= hi else 0.0
                 p_null = np.exp(_lorentz_logpdf(o.cc, o.null_mean, max(o.null_sd, 0.05)))
                 sc += np.log(0.5 * p_tw + 0.5 * p_null + 1e-300)
                 cout.append(o.cc)
+                rout.append(o.cc / o.cc_exp)
             else:
-                lo, hi = o.null_mean, max(cc_true, o.null_mean + 0.1)
+                lo, hi = o.null_mean, max(o.cc_exp, o.null_mean + 0.1)
                 p_null = np.exp(_lorentz_logpdf(o.cc, o.null_mean, max(o.null_sd, 0.05)))
                 p_part = (1.0 / (hi - lo)) if lo <= o.cc <= hi else 0.0
                 sc += np.log(0.5 * p_null + 0.5 * p_part + 1e-300)
                 cout.append(o.cc)
+                rout.append(o.cc / o.cc_exp)
         # global consistency with the L-test: a candidate group allows twinning only by elements outside it, at
         # most the fraction their CCs imply; data MORE twinned than that (lower <|L|>) rule the group out. One-sided:
         # noise and NCS only raise <|L|> (look less twinned), so observing less twinning never counts against it.
         if np.isfinite(L_mean) and alpha_L >= 0.1:
-            a_max = max((_alpha_from_ratio(c_ / cc_true) for c_ in cout if np.isfinite(c_)), default=0.0)
+            a_max = max((_alpha_from_ratio(r_) for r_ in rout if np.isfinite(r_)), default=0.0)
             L_pred = _L_from_alpha(a_max)
             if L_mean < L_pred:
                 sc += -0.5 * ((L_pred - L_mean) / L_SD) ** 2
@@ -324,10 +519,16 @@ def score_symmetry(hkl_red, I, sig, s, phi, cands, isig_limit=6.0, verbose=True,
     if verbose:
         log(f"  SYMMETRY: using {use.sum()} observations to {1 / smax:.2f} A (<I>/<sigma> >= {isig_limit}); "
             f"expected CC for true symmetry {cc_true:.3f}; L-test <|L|> {L_mean:.3f} -> systematic width {gam_sys:.3f}")
+        if sep_D is not None:
+            log("  SYMMETRY: repeats lose correlation with their rotation separation (CC relative to the best-agreeing "
+                "separations: " + ", ".join(f"{SEP_EDGES[b]:g}-{SEP_EDGES[b + 1]:g} deg {d:.3f}"
+                                            for b, d in zip(sep_fit["bins"], sep_fit["D"])) +
+                "): expected CC of each element matched to the separations of its pairs")
         log("  SYMMETRY: symmetry elements:")
         for o in sorted(opscores.values(), key=lambda o: -np.nan_to_num(o.cc, nan=-9)):
             z = getattr(o, "z", np.nan)
-            extra = (f"  CC/expected lo {o.ratio_lo:.3f} hi {o.ratio_hi:.3f}" if np.isfinite(o.ratio_lo) else "") + \
+            extra = (f"  expected {o.cc_exp:.3f}" if sep_D is not None and np.isfinite(o.cc_exp) else "") + \
+                (f"  CC/expected lo {o.ratio_lo:.3f} hi {o.ratio_hi:.3f}" if np.isfinite(o.ratio_lo) else "") + \
                 (f"  [{o.pseudo}]" if o.pseudo else "")
             log(f"     {o.order}-fold  CC {o.cc:6.3f}  Z {z:7.1f}  pairs {o.n:7d}  R={o.R.tolist()}{extra}")
         Pi0 = np.linalg.inv(results[0].cand.P)
@@ -335,7 +536,7 @@ def score_symmetry(hkl_red, I, sig, s, phi, cands, isig_limit=6.0, verbose=True,
         for kb, o in opscores.items():
             if kb not in chosen and np.isfinite(o.cc) and o.cc > o.null_mean + 0.25:
                 log(f"  SYMMETRY WARNING: {o.order}-fold R={o.R.tolist()} correlates with CC {o.cc:.2f} "
-                    f"(expected {cc_true:.2f} for symmetry): partial merohedral twinning or pseudo-symmetry")
+                    f"(expected {o.cc_exp:.2f} for symmetry): partial merohedral twinning or pseudo-symmetry")
         log("  SYMMETRY: Laue-group candidates (best first; accepted if L >= 0.2 L_max):")
         for r in results[:8]:
             acc = "*" if r.prob >= 0.2 * results[0].prob else " "

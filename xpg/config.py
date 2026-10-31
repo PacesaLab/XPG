@@ -152,6 +152,8 @@ class Params:
     wfac1: float = 1.0                     # WFAC1 (sigma multiplier for misfit classification)
     nbatch: int | None = None              # NBATCH (number of scale batches; None -> 5 degree knots)
     fixed_scale_range: tuple | None = None # DATA_RANGE_FIXED_SCALE_FACTOR= first last factor
+    min_shell_completeness: float = 0.5    # xpg: the resolution limit stops where thin shells fall below this fraction
+                                           # of the low-resolution completeness (detector corners; 0 = off)
     # --- runtime ---
     lib: str | None = None
     extra: dict = field(default_factory=dict)

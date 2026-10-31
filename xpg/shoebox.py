@@ -182,6 +182,20 @@ def _plan_passes(order, blocks_refl, lattice_of, need_hi, t_row, w_row, n_frames
     return passes, dict(peak=worst[0], open=worst[1], block=worst[2], one=tried[0][1][0], plan=name)
 
 
+def _split_blocks(blocks_refl, z, w_row, k):
+    """Each block's rows in k parts of consecutive z (phi) with about equal shoebox bytes (w_row), rows in index order
+    within a part. Returns (parts, block of each part); empty parts are dropped."""
+    parts, parent = [], []
+    for b, rows in enumerate(blocks_refl):
+        o = rows[np.argsort(z[rows], kind="stable")]
+        c = np.cumsum(w_row[o])
+        for p_ in np.split(o, np.searchsorted(c, c[-1] * np.arange(1, k) / k, side="right") if o.size else []):
+            if p_.size:
+                parts.append(np.sort(p_))
+                parent.append(b)
+    return parts, parent
+
+
 GATHER_CHUNK = 1024   # shoebox rows per gather task (threads: XPG_GATHER_THREADS, default min(8, CPUs))
 
 

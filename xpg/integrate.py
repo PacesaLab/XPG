@@ -37,7 +37,7 @@ from .integrate_kernels import (FG_R, N_BOX, N_FG, PROFILE_GRID, RC_C, _KERNEL_C
                                 gaussian_profile, make_kernels, rc_basis_np, rc_default_weights)
 from .shoebox import (GATHER_CHUNK, KERNEL_RESERVE, SB_OFF, _decode_bins, _gather_process_ok, _HostChunk,
                       _integrate_budget, _job_memory, _map_fd, _plan_passes, _recv_fds, _sb_arg, _send_fds,
-                      _shared_zeros, _Stager)
+                      _shared_zeros, _split_blocks, _Stager)
 
 
 N_BOX_Z = 4.0    # shoebox half-size along phi in sigma units
@@ -52,6 +52,7 @@ XY_BUCKETS = (9, 13, 17, 23, 31, 41, 55, 73, 97)   # shoebox sides (px): per-ref
 SUPERPIXEL = 2.5
 SUPERPIXEL_MAX = 4
 QUEUE_MAX_BLOCKS = 6   # blocks the gather process may run ahead, memory permitting
+BLOCK_PARTS_MAX = 8    # parts per phi block at most when whole blocks cannot meet the shoebox memory budget
 CHUNK_ELEMENTS = int(float(__import__("os").environ.get("XPG_CHUNK_ELEMENTS", 1.5e7)))   # voxels per kernel call
 _CHUNK_SET = "XPG_CHUNK_ELEMENTS" in __import__("os").environ
 
@@ -453,8 +454,10 @@ def _integrate(images, exp_blocks, block_edges, model: IntegrationModel, dmin, d
         sd_fit = float(np.clip(np.sqrt(max(np.median(md), 1e-12)), 0.5 * sd, 2.0 * sd))
         sd_new = float(np.exp((n * np.log(sd_fit) + 300.0 * np.log(sd)) / (n + 300.0)))
         adapt.update(sd=sd_new, sm=float(sm_new), rcw=w.astype(np.float32))
+        # sigma_*_fit: this block's own measurement, before the shrinkage towards the run's widths
         block_params[b] = dict(sigma_d=float(np.degrees(sd_b)), sigma_m=float(np.degrees(sm_new)), n=int(n),
-                               rcw=w.round(3).tolist())
+                               rcw=w.round(3).tolist(), sigma_d_fit=float(np.degrees(sd_fit)),
+                               sigma_m_fit=float(np.degrees(sm_fit)))
         return float(sm_new), w.astype(np.float32)
     block_params = {}
     def process_block(b, bufs):
@@ -595,9 +598,29 @@ def _integrate(images, exp_blocks, block_edges, model: IntegrationModel, dmin, d
     mem_budget = _integrate_budget() if pending else None
     passes, mp_ = _plan_passes(pending, blocks_refl, lattice_of, [h_ - (f_first - 1) for h_ in need_hi], t_row,
                                w_row, n_fr, mem_budget) if pending else ([pending], None)
+    parent = None                        # phi block of each part when the blocks are integrated in parts
+    if mp_ is not None and mem_budget is not None and mp_["peak"] > mem_budget > KERNEL_RESERVE:
+        # passes regroup whole blocks, so a pass holds >= 3x its largest block + KERNEL_RESERVE: when no grouping fits,
+        # each phi block is integrated in k parts of consecutive phi (the block's geometry; profiles and widths learnt
+        # per part), the fewest parts that fit, else the lowest peak (a budget below the fixed reserve fits nothing)
+        best = None
+        for n_parts in range(2, BLOCK_PARTS_MAX + 1):
+            parts, par = _split_blocks(blocks_refl, refl["z"], w_row, n_parts)
+            lo_k = [int(zstart[r].min()) for r in parts]
+            hi_k = [int(zend[r].max()) for r in parts]
+            pk, mk = _plan_passes(sorted(range(len(parts)), key=lambda v: lo_k[v]), parts, [lattice_of[b] for b in par],
+                                  [h_ - (f_first - 1) for h_ in hi_k], t_row, w_row, n_fr, mem_budget)
+            if best is None or mk["peak"] < best[1]["peak"]:
+                best = (pk, mk, n_parts, parts, par, lo_k, hi_k)
+            if mk["peak"] <= mem_budget:
+                break
+        if best[1]["peak"] < mp_["peak"]:
+            passes, mk, n_parts, blocks_refl, parent, need_lo, need_hi = best
+            exp_blocks = [exp_blocks[b] for b in parent]
+            mp_ = dict(mk, one=mp_["one"], plan=f"each phi block in {n_parts} parts, {mk['plan']}")
     if mem_budget is not None and mp_ is not None:
         queue_bytes = min(queue_bytes, max(mem_budget - mp_["open"] - mp_["block"] - KERNEL_RESERVE, 0.0))
-        if verbose and len(passes) > 1:
+        if verbose and (len(passes) > 1 or parent is not None):
             log(f"  INTEGRATE: shoebox memory in one pass over the frames ~{mp_['one'] / 2 ** 30:.1f} GB > budget "
                 f"{mem_budget / 2 ** 30:.1f} GB (XPG_INTEGRATE_MEM_GB): {mp_['plan']}, peak ~{mp_['peak'] / 2 ** 30:.1f} GB")
     pending = list(passes[0])
@@ -952,6 +975,16 @@ def _integrate(images, exp_blocks, block_edges, model: IntegrationModel, dmin, d
     refl["ix0"], refl["iy0"] = ix0 * pxs, iy0 * pxs        # detector pixels (first pixel of the first super-pixel)
     if (pxs > 1).any():
         refl["pxs"] = pxs
+    if parent is not None:
+        # blocks integrated in parts: each block keeps the profiles and widths of its part with the most strong
+        # reflections (a part's profiles are in units of its own sigma_D)
+        rep = {}
+        for v in prof_by_block:
+            n_v = block_params.get(v, {}).get("n", 0)
+            if parent[v] not in rep or n_v > rep[parent[v]][0]:
+                rep[parent[v]] = (n_v, v)
+        prof_by_block = {b: prof_by_block[v] for b, (_, v) in rep.items()}
+        block_params = {b: block_params[v] for b, (_, v) in rep.items() if v in block_params}
     if verbose:
         ok = np.isfinite(refl["iprf"])
         log(f"  INTEGRATE: {ok.sum()} reflections integrated in {time.time() - t0:.1f}s "

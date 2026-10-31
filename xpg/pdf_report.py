@@ -192,6 +192,12 @@ def _f(v, fmt):
         return "–"
 
 
+def _limit_label(S):
+    """Tile label of the isotropic resolution limit: what set it (summary keys of stage_scale._write_report)."""
+    return ("Resolution (completeness)" if S.get("completeness_limit") else "Resolution (data edge)"
+            if S.get("cc_half_fit") else "Resolution (CC½ = 0.3)")
+
+
 def _page1(pdf, D, img):
     import matplotlib.pyplot as plt
     S, run = D["summary"], D["run"]
@@ -215,7 +221,8 @@ def _page1(pdf, D, img):
     ov, outer = st.get("overall") or S.get("overall") or {}, st.get("outer") or {}
     pc = lambda v: 100 * v if v is not None and v <= 1.5 else v
     tiles = [("Space group", S.get("space_group") or "–", ""),
-             ("Resolution (CC½ = 0.3)", f"{_f(S.get('cc_half_cutoff'), '.2f')} Å",
+             (_limit_label(S),
+              f"{_f(S.get('cc_half_cutoff'), '.2f')} Å",
               ("anisotropic " + " / ".join(f"{v:.2f}" for v in S["aniso"]["limits"]) + " Å")
               if (S.get("aniso") or {}).get("limits") else ""),
              ("ISa", _f(S.get("isa"), ".1f"), ""),
@@ -231,26 +238,34 @@ def _page1(pdf, D, img):
     cell = S.get("cell")
     fig.text(0.05, 0.758, ("Cell  " + "  ".join(f"{v:.2f}" for v in cell[:3]) + "  Å    " +
                            "  ".join(f"{v:.1f}" for v in cell[3:]) + "°") if cell else "", fontsize=7.5, color=INK2)
+    wl = S.get("wavelength") or (D["geometry"] or {}).get("wavelength")
     # diffraction image
     _image_panel(fig.add_axes([0.56, 0.752, 0.39, 0.172]), img, D["geometry"], S.get("cc_half_cutoff"))
     if img is not None:
-        fig.text(0.56, 0.742, "first frame; rings: resolution; orange: the CC½ = 0.3 limit", fontsize=5.8, color=MUTE)
+        why = _limit_label(S)[12:-1]
+        fig.text(0.56, 0.742, "first frame; rings: resolution; orange: the " +
+                 ("CC½ = 0.3 limit" if why.startswith("CC") else f"resolution limit ({why})"), fontsize=5.8, color=MUTE)
     # statistics table
     sa = S.get("statistics_aniso") or {}
     ax = _panel(fig, [0.05, 0.505, 0.46, 0.21], "Statistics")
     cols = [st.get("overall"), st.get("inner"), st.get("outer")] if st else [S.get("overall") or {}]
     cols += [sa.get("overall"), sa.get("outer")] if sa else []
-    rows = [("Resolution (Å)", lambda s: f"{_f(s.get('dmax'), '.0f' if (s.get('dmax') or 0) >= 10 else '.1f')}–"
+    # Table 1: per-shell rows, and the data-set rows (one value, in the overall column)
+    rows = [("Wavelength (Å)", _f(wl, ".4f")), ("Space group", S.get("space_group") or "–"),
+            ("Resolution (Å)", lambda s: f"{_f(s.get('dmax'), '.0f' if (s.get('dmax') or 0) >= 10 else '.1f')}–"
              f"{_f(s.get('dmin'), '.2f')}"),
+            ("Total observations", lambda s: f"{int(s['n_obs']):,}" if s.get("n_obs") else "–"),
             ("Unique reflections", lambda s: f"{int(s['n_uniq']):,}" if s.get("n_uniq") else "–"),
-            ("Completeness (%)", lambda s: _f(pc(s.get("completeness")), ".1f")),
             ("Multiplicity", lambda s: _f(s.get("multiplicity"), ".1f")),
-            ("I/σ", lambda s: _f(s.get("i_over_sigma"), ".1f")), ("Rmeas", lambda s: _f(s.get("rmeas"), ".3f")),
+            ("Completeness (%)", lambda s: _f(pc(s.get("completeness")), ".1f")),
+            ("Mean I/σ(I)", lambda s: _f(s.get("i_over_sigma"), ".1f")), ("Wilson B (Å²)", _f(S.get("wilson_b"), ".1f")),
+            ("Rmerge", lambda s: _f(s.get("rmerge"), ".3f")), ("Rmeas", lambda s: _f(s.get("rmeas"), ".3f")),
             ("Rpim", lambda s: _f(s.get("rpim"), ".3f")), ("CC½", lambda s: _f(s.get("cc_half"), ".3f")),
             ("CCano", lambda s: _f(s.get("cc_ano"), ".3f"))]
     n_iso = 3 if st else 1
     hdr = ["", "overall", "inner", "outer"][:n_iso + 1] + (["overall", "outer"] if sa else [])
-    body = [[lab] + [fn(c or {}) for c in cols] for lab, fn in rows]
+    body = [[lab] + ([fn] + [""] * (len(cols) - 1) if isinstance(fn, str) else [fn(c or {}) for c in cols])
+            for lab, fn in rows]
     if sa and sa.get("ellipsoidal_completeness") is not None:
         body.append(["Ellipsoidal compl. (%)"] + [""] * n_iso + [_f(100 * sa["ellipsoidal_completeness"], ".1f"), ""])
     xs = [0.0] + [0.42 + 0.12 * j + (0.04 if j >= n_iso else 0) for j in range(len(cols))]
@@ -263,7 +278,7 @@ def _page1(pdf, D, img):
     for r, row in enumerate([hdr] + body):
         y = 1 - (r + 1.7) / n
         for c, txt in enumerate(row):
-            ax.text(xs[c], y, txt, fontsize=6.6, ha="left" if c == 0 else "right", va="center",
+            ax.text(xs[c], y, txt, fontsize=6.2, ha="left" if c == 0 else "right", va="center",
                     color=(MUTE if r == 0 or c == 0 else INK), fontweight="bold" if r == 0 else "normal")
         ax.plot([0, 1], [y - 0.5 / n] * 2, color=GRID, lw=0.4)
     # problems

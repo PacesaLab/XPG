@@ -235,6 +235,7 @@ class Pipeline(IndexStage, IntegrateStage, FilterStage, LatticeStage, ScaleStage
                 or not (self.wd / "xpg_unmerged.mtz").exists():
             return
         from .mr import merge_in
+        from .symops import centring_reindex
         Ast = self.st.exp.crystal.Astar
         done, written = set(), []
         for a in self.st.results.get("point_group_alternatives", []):
@@ -246,10 +247,10 @@ class Pipeline(IndexStage, IntegrateStage, FilterStage, LatticeStage, ScaleStage
                 k += 1
             done.add(lab)
             try:
-                # final indices -> the alternative's conventional basis (the same lattice: integer up to refinement)
-                T = np.linalg.solve(a["Astar"], Ast)
-                Ti = np.round(T)
-                if np.abs(T - Ti).max() > 0.05:
+                # final indices -> the alternative's conventional basis (the same lattice: integral up to refinement
+                # on the reflections the centring allows; fractions between centred settings, e.g. two C cells)
+                Ti = centring_reindex(np.linalg.solve(a["Astar"], Ast), self.st.space_group)
+                if Ti is None:
                     self.log(f"  AUDIT: {a['label']} not merged (no integer index transformation)")
                     continue
                 # cell of the refined final crystal on the alternative's axes (merge_in applies its constraints)
@@ -258,12 +259,11 @@ class Pipeline(IndexStage, IntegrateStage, FilterStage, LatticeStage, ScaleStage
                 ln = np.sqrt(np.diag(G))
                 ang = np.degrees(np.arccos([G[1, 2] / (ln[1] * ln[2]), G[0, 2] / (ln[0] * ln[2]),
                                             G[0, 1] / (ln[0] * ln[1])]))
-                merge_in(self.wd, hm, self.wd / f"xpg_{lab}", log=lambda *x: None, reindex=Ti.astype(int),
-                         cell=np.r_[ln, ang])
+                merge_in(self.wd, hm, self.wd / f"xpg_{lab}", log=lambda *x: None, reindex=Ti, cell=np.r_[ln, ang])
                 self.log(f"  AUDIT: close point-group call ({rec['choice']}, posterior {rec['margin']:.2f}): data also "
                          f"merged as {a['label']} ({a['prob']:.2f}) in {hm} -> xpg_{lab}_merged_iso.mtz")
                 written.append(dict(label=a["label"], space_group=hm, posterior=a["prob"],
-                                    file=f"xpg_{lab}_merged_iso.mtz", reindex=Ti.astype(int).tolist()))
+                                    file=f"xpg_{lab}_merged_iso.mtz", reindex=Ti.tolist()))
             except Exception as e:  # pragma: no cover
                 self.log(f"  AUDIT: {a['label']} not merged ({type(e).__name__}: {e})")
         summ = self.wd / "xpg_summary.json"
@@ -306,6 +306,12 @@ class Pipeline(IndexStage, IntegrateStage, FilterStage, LatticeStage, ScaleStage
         self.log("\n=== DETECTOR ===")
         self.st.mask = static_mask(self.p, self.st.geom)
         self.log(f"  static mask: {100 * (1 - self.st.mask.mean()):.2f}% untrusted (keywords, trusted region)")
+        if not self.p.frames():
+            raise RuntimeError(f"DETECTOR: no frames to process (frames {self.p.data_range[0]}-{self.p.data_range[1]}, "
+                               f"excluded or unreadable: {self.p.exclude_data_range})")
+        if not self.st.mask.any():
+            raise RuntimeError("DETECTOR: every pixel is untrusted: check the detector geometry (pixel size, beam "
+                               "position) and the trusted region / untrusted areas")
 
     def job_background(self):
         self.log("\n=== BACKGROUND ===")
@@ -346,6 +352,9 @@ class Pipeline(IndexStage, IntegrateStage, FilterStage, LatticeStage, ScaleStage
         for lo, hi in ice:
             keep &= ~((d >= lo) & (d <= hi))
         self.st.spots = sp.subset(keep)
+        if not len(self.st.spots):
+            raise RuntimeError(f"SPOTS: no spots on {len(frames)} frames ({len(sp)} before the resolution / ice-ring "
+                               f"filters): no diffraction, or check spot_frames and the detector settings")
         self._write_spots()
         try:
             zf = np.asarray(self.st.spots.z)

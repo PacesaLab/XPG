@@ -275,6 +275,32 @@ def zero_dose_merge(uid, I, sig, dose, significance=0.1, min_obs=3):
     return I0, s0, use
 
 
+def _zero_dose_into_merged(merged, uk, I0, s0, anomalous):
+    """Replace the merged intensities (merging_statistics' dict) by the zero-dose ones of the unique keys uk
+    (unique_ids; Bijvoet mates separate when anomalous). Returns the mask of uk present in merged: keys absent
+    from it (systematic absences, which merging_statistics drops) are not mapped, so searchsorted cannot place
+    them on the next reflection."""
+    pk = hkl_key(merged["hkl"])
+    kp = (uk >> 1) if anomalous else uk
+    inm = np.isin(kp, pk)
+    pos = np.searchsorted(pk, kp[inm])
+    I0, s0 = I0[inm], s0[inm]
+    if anomalous:
+        minus = (uk[inm] & 1).astype(bool)
+        for arr, sarr, sel_ in (("Iplus", "sigIplus", ~minus), ("Iminus", "sigIminus", minus)):
+            merged[arr] = np.full(pk.size, np.nan)
+            merged[sarr] = np.full(pk.size, np.nan)
+            merged[arr][pos[sel_]] = I0[sel_]
+            merged[sarr][pos[sel_]] = s0[sel_]
+        wp = np.where(np.isfinite(merged["sigIplus"]), 1 / merged["sigIplus"] ** 2, 0.0)
+        wm = np.where(np.isfinite(merged["sigIminus"]), 1 / merged["sigIminus"] ** 2, 0.0)
+        merged["I"] = (wp * np.nan_to_num(merged["Iplus"]) + wm * np.nan_to_num(merged["Iminus"])) / (wp + wm)
+        merged["sig"] = 1 / np.sqrt(wp + wm)
+    else:
+        merged["I"][pos], merged["sig"][pos] = I0, s0
+    return inm
+
+
 DCC_HARMFUL = 0.02     # fallback when the noise cannot be estimated
 DCC_K = 6.0            # harmful = Delta-CC1/2 below -DCC_K x its null noise ...
 DCC_FLOOR = 0.01       # ... and below -DCC_FLOOR
@@ -311,12 +337,17 @@ def _dcc_null_sd(uid, I, act, ds, nsets, n_rep=2, seed=7, max_obs=200000):
 
 
 def run_multiset(inp_path, outdir=None, log=print, anisotropy=True, reject_nonisomorphous=False, _exclude=(),
-               inp_text=None, export_legacy=False, stop_at_reference=False, prior=None, compare_shells=None):
+               inp_text=None, export_legacy=False, stop_at_reference=False, prior=None, compare_shells=None,
+               d_limit=None, d_limit_tol=0.0):
     """stop_at_reference: when the rejections leave only the reference set, return without re-scaling it alone (an
     evaluation that only needs to know whether anything merges; no outputs, cc_half_cutoff None). prior: a fixed
     absorption / modulation prior width instead of the cross-validated one. compare_shells: resolution shells (e.g.
     another data set's) over which the statistics are also returned (shells_compare, overall_compare), for a
-    comparison at equal resolution."""
+    comparison at equal resolution. d_limit: another data set's applied limit (data edge, completeness); the merged
+    outputs end there when it is more conservative than their CC1/2 = 0.3 estimate or the estimate is coarser by at
+    most d_limit_tol (relative), and only then is the cut returned (d_written, with the outputs' anisotropic
+    statistics, merged reflections and Wilson B); cc_half_cutoff stays the estimate. excluded (with
+    reject_nonisomorphous): the sets rejected by Delta-CC1/2 and those sharing no structure with the reference."""
     inp_path = Path(inp_path)
     wd = Path(outdir or inp_path.parent)
     wd.mkdir(parents=True, exist_ok=True)
@@ -383,6 +414,7 @@ def run_multiset(inp_path, outdir=None, log=print, anisotropy=True, reject_nonis
     # --- sets without common structure: CC of raw intensities to the reference set ~ 0 (even unrelated structures
     # share the resolution fall-off, so this is far below any isomorphous set): a misindexed lattice or another
     # crystal form. Joint scaling cannot bring them into agreement; they are excluded before scaling.
+    nocommon = []
     if len(sets) > 1:
         ref_i = next((i for i, s in enumerate(sets) if s.reference), 0)
         rk, rI = merge_asu(sets[ref_i].hkl, sets[ref_i].I, sets[ref_i].sig, sg)
@@ -395,6 +427,7 @@ def run_multiset(inp_path, outdir=None, log=print, anisotropy=True, reject_nonis
                     log(f"  MERGE WARNING: set {i + 1} ({Path(s.path).name}) correlates with the reference set at CC "
                         f"{cc:.3f} on {nc} common reflections (no common structure: misindexed lattice or another "
                         f"crystal form): excluded")
+                    nocommon.append(s.inp["file"])
                     continue
             keep.append(s)
         sets = keep
@@ -566,12 +599,13 @@ def run_multiset(inp_path, outdir=None, log=print, anisotropy=True, reject_nonis
         if stop_at_reference and len(rest) == 1 and rest[0] is sets[next((i for i, s in enumerate(sets) if s.reference), 0)]:
             log(f"\n  MERGE: rejecting {len(bad)} data set(s) with negative/outlying Delta-CC1/2; only the reference "
                 f"set is left (not re-scaled)")
-            return {o["file"]: dict(cc_half_cutoff=None, n_obs=None, excluded=list(_exclude) + sorted(names))
+            return {o["file"]: dict(cc_half_cutoff=None, n_obs=None,
+                                    excluded=list(_exclude) + sorted(names) + nocommon)
                     for o in outputs} | {"per_dataset": rows}
         log(f"\n  MERGE: rejecting {len(bad)} data set(s) with negative/outlying Delta-CC1/2 and re-scaling")
         return run_multiset(inp_path, outdir, log, anisotropy, reject_nonisomorphous, tuple(_exclude) + tuple(names),
                           inp_text=inp_text, export_legacy=export_legacy, stop_at_reference=stop_at_reference,
-                          prior=prior, compare_shells=compare_shells)
+                          prior=prior, compare_shells=compare_shells, d_limit=d_limit, d_limit_tol=d_limit_tol)
     # --- outputs ---
     from .io.mtz import write_unmerged_mtz
     from .outputs import write_merged_outputs
@@ -599,22 +633,7 @@ def run_multiset(inp_path, outdir=None, log=print, anisotropy=True, reject_nonis
             # separately (merging them first turns the anomalous difference into a spurious dose slope)
             uidm, ukm = unique_ids(hasu[a_], plus[a_], anomalous=anom)
             I0, s0, used = zero_dose_merge(uidm, Is[a_], ss[a_], dose[a_], glob["zero_dose"])
-            pk = hkl_key(merged["hkl"])
-            if anom:
-                pos = np.searchsorted(pk, ukm >> 1)
-                minus = (ukm & 1).astype(bool)
-                for arr, sarr, sel_ in (("Iplus", "sigIplus", ~minus), ("Iminus", "sigIminus", minus)):
-                    merged[arr] = np.full(pk.size, np.nan)
-                    merged[sarr] = np.full(pk.size, np.nan)
-                    merged[arr][pos[sel_]] = I0[sel_]
-                    merged[sarr][pos[sel_]] = s0[sel_]
-                wp = np.where(np.isfinite(merged["sigIplus"]), 1 / merged["sigIplus"] ** 2, 0.0)
-                wm = np.where(np.isfinite(merged["sigIminus"]), 1 / merged["sigIminus"] ** 2, 0.0)
-                merged["I"] = (wp * np.nan_to_num(merged["Iplus"]) + wm * np.nan_to_num(merged["Iminus"])) / (wp + wm)
-                merged["sig"] = 1 / np.sqrt(wp + wm)
-            else:
-                pos = np.searchsorted(pk, ukm)
-                merged["I"][pos], merged["sig"][pos] = I0, s0
+            used = used[_zero_dose_into_merged(merged, ukm, I0, s0, anom)]
             log(f"  MERGE: zero-dose extrapolation applied to {used.sum()} of {used.size} reflections "
                 f"(significance {glob['zero_dose']})")
         log(f"\n  MERGE: output {out['file']} ({'merged' if out['merge'] else 'unmerged'}, "
@@ -640,11 +659,48 @@ def run_multiset(inp_path, outdir=None, log=print, anisotropy=True, reject_nonis
         write_unmerged_mtz(f"{stem}_unmerged.mtz", sg, cell, wl, hasu[a_], isym[a_],
                            (ds[a_] * 10000 + np.floor(np.concatenate([s.zd for s in sets])[a_]) + 1).astype(int),
                            Is[a_], ss[a_], xs[a_], ys[a_], phi[a_], np.ones(a_.sum()))
-        write_merged_outputs(merged, cell, sg, dcut, wl, Path(f"{stem}"), log=log, anisotropy=anisotropy)
+        # the limit given also when the estimate is coarser by at most d_limit_tol: the caller counts the two as the
+        # same resolution (its verdict tolerance), and the outputs then end where the caller's reports do
+        d_out = d_limit if d_limit and (not dcut or dcut <= (1.0 + d_limit_tol) * d_limit) else dcut
+        if d_out != dcut:
+            log(f"  MERGE: merged output cut at {d_out:.2f} A, the limit given " +
+                ("(more conservative than the CC1/2 = 0.3 estimate)" if not dcut or dcut < d_out else
+                 f"(the CC1/2 = 0.3 estimate, {dcut:.2f} A, is within {100 * d_limit_tol:g}% of it)"))
+        an = write_merged_outputs(merged, cell, sg, d_out, wl, Path(f"{stem}"), log=log, anisotropy=anisotropy)
+        lim = {}
+        if d_limit and d_out == d_limit:
+            lim = dict(d_written=d_out, **_limit_statistics(hasu[a_], plus[a_], Is[a_], ss[a_], cell, sg, merged, an,
+                                                            d_out, f"{stem.name}_anisotropic.mtz", log))
         results[out["file"]] = dict(overall=overall, shells=shells, cc_half_cutoff=dcut, n_obs=int(a_.sum()),
-                                    excluded=list(_exclude) if reject_nonisomorphous else None, **dcc_info, **cmp)
+                                    excluded=list(_exclude) + nocommon if reject_nonisomorphous else None, **dcc_info,
+                                    **cmp, **lim)
     results["per_dataset"] = rows
     return results
+
+
+def _limit_statistics(hasu, plus, I, sig, cell, sg, merged, an, dmin, aniso_file, log):
+    """Statistics of outputs cut at another data set's applied limit, for reports that put them in place of that data
+    set's: the anisotropic data (outputs.aniso_statistics on write_merged_outputs' summary an), the merged reflections
+    and Wilson B (to dmin), computed as stage_scale does for it."""
+    from .analysis import twinning_analysis
+    from .outputs import aniso_statistics
+    an = dict(an) if an else None
+    inside = an.pop("inside_hkl") if an else None
+    a = aniso_statistics(hasu, plus, I, sig, cell, sg, merged["hkl"], an, inside)
+    if a is not None:
+        log("\n  MERGE: anisotropic data (inside the cut-off surface, limits "
+            + " / ".join(f"{v:.2f}" for v in an["limits"]) + f" A; {aniso_file})"
+            + (f", ellipsoidal completeness {100 * a[2][2]:.1f}%" if a[2] else "") + "\n"
+            + format_stats_table(a[0], a[1], anomalous=True) + "\n")
+    try:
+        # tNCS (not known here) enters only the intensity moments, not the Wilson fit
+        tw = twinning_analysis(merged["hkl"], merged["I"], merged["sig"], cell, sg, dmin=dmin)
+        wb, wd = tw.wilson_b, tw.wilson_dmin
+    except Exception as e:  # pragma: no cover
+        log(f"  MERGE: Wilson B not determined ({e})")
+        wb, wd = float("nan"), float("nan")
+    return dict(aniso=an, shells_aniso=a[0] if a else None, overall_aniso=a[1] if a else None,
+                ellipsoidal_completeness=a[2][2] if a and a[2] else None, merged=merged, wilson_b=wb, wilson_dmin=wd)
 
 
 def _write_legacy_merged(path, sets, sg, cell, hkl, I, sig, xd, yd, zd, iset, out, merged):

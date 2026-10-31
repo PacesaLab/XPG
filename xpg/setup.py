@@ -25,6 +25,16 @@ def _template_from_file(path: str) -> str:
     return os.path.join(os.path.dirname(path), base[:last.start()] + "?" * len(last.group()) + base[last.end():])
 
 
+def _first_image(images: str) -> str:
+    """The first file of a ?-template (the file itself otherwise)."""
+    if "?" not in images:
+        return images
+    files = sorted(glob.glob(images.replace("?", "[0-9]")))
+    if not files:
+        raise FileNotFoundError(f"no images match {images}")
+    return files[0]
+
+
 def params_from_images(images: str, workdir=".") -> Params:
     images = os.path.abspath(images)
     if os.path.isdir(images):
@@ -61,7 +71,7 @@ def params_from_images(images: str, workdir=".") -> Params:
         p.overload = float(h.get("count_cutoff") or 2 ** 31 - 2)
         if h.get("pixel_mask") is None and (iset.nx + 10) % 1040 == 0:
             p.untrusted_rectangles = eiger_gaps(iset.nx, iset.ny)
-    elif is_smv(images if "?" not in images else sorted(glob.glob(images.replace("?", "[0-9]")))[0]):
+    elif is_smv(_first_image(images)):
         tmpl = images if "?" in images else _template_from_file(images)
         p, geo_note = _smv_params(SMVImageSet(tmpl), tmpl)
     else:

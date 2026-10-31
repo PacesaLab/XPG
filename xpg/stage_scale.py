@@ -15,10 +15,10 @@ from .io.legacy import write_legacy_hkl, write_xparm
 from .io.mtz import write_unmerged_mtz
 from .io.xpgfiles import write_geometry, write_spots
 from .lattice import lattice_candidates
-from .merging import cc_half_cutoff, format_stats_table, merging_statistics
+from .merging import cc_half_cutoff, completeness_limit, format_stats_table, merging_statistics
 from .models import Crystal, Experiment
 from .models import d_spacing_from_exp
-from .outputs import _isa_txt, write_merged_outputs
+from .outputs import _isa_txt, aniso_statistics, write_merged_outputs
 from .refine import refine
 from .scaling import Scaler
 from .stage_filters import FILTER_CYCLES
@@ -93,6 +93,7 @@ class ScaleStage:
         if rings is None:
             rings = self._validate_ice_rings(refl, ok)
         ranges = list(self.p.exclude_resolution) + list(rings)
+        self._excl_ranges = ranges
         excl = np.zeros_like(ok)
         if ranges:
             d = d_spacing_from_exp(refl["hkl"], self.st.exp)
@@ -183,6 +184,8 @@ class ScaleStage:
             s_lo, s_hi = 1.0 / hi, 1.0 / lo
             st_ = band_stats(s_lo, s_hi)
             if st_ is None:
+                self.log(f"  ICE: ring {lo:.3f}-{hi:.3f} A: too few observations on the ring or its flanks to test "
+                         "-> excluded")
                 keep_out.append((lo, hi))
                 continue
             scat, lev, nb_ = st_
@@ -210,14 +213,22 @@ class ScaleStage:
                      f"{note}) -> {'excluded' if bad else 'kept (not worse than ice-free shells)'}")
             if bad:
                 keep_out.append((lo, hi))
-        if self.st.space_group is not None:          # final decision once the symmetry (mates) is known
-            self.st.results["ice_rings_excluded"] = keep_out
+        # recorded on every path, also when the mates are those of P 1 (no space group yet): the report and the
+        # extra lattices read what was applied here; the next SCALE run (pass 2) decides anew and replaces it
+        self.st.results["ice_rings_excluded"] = keep_out
         return keep_out
 
     def job_scale(self, final=False):
         self.log("\n=== SCALE ===" if not final else "\n=== SCALE (final) ===")
         p = self.p
-        self.st.results.pop("ice_rings_excluded", None)   # decided anew from this run's data
+        # decided anew from this run's data: without a resolution limit in this run (pass 2), the statistics inside
+        # the previous run's limit must not reach the reports, the summary or the lattice-merge comparison; nor the
+        # previous run's anisotropy, twinning and tNCS results when this run's analysis fails or is off (a rerun
+        # without anisotropy): its anisotropic statistics and detwinned data would use them as well
+        for k in ("ice_rings_excluded", "shells_cut", "overall_cut", "aniso", "shells_aniso", "overall_aniso",
+                  "ellipsoidal_completeness", "twinning", "tncs", "hidden_twin"):
+            self.st.results.pop(k, None)
+        self._aniso_inside = self._hidden_twin = None
         refl = self.st.refl
         exp = self.st.exp
         g = exp.geom
@@ -367,23 +378,40 @@ class ScaleStage:
                          x=[float(1 / (0.5 * (sh.dmax + sh.dmin)) ** 2) for sh in fine],
                          series={"CC1/2": [float(sh.cc_half) for sh in fine],
                                  "<I/sigma>": [float(sh.i_over_sigma) for sh in fine],
-                                 "completeness (%)": [float(sh.completeness) * (100.0 if max((x.completeness for x in fine),
-                                                      default=0) <= 1.0 else 1.0) for sh in fine]})
+                                 "completeness (%)": [100.0 * float(sh.completeness) for sh in fine]})
+        # the fit can cross 0.3 where no reflection was kept: beyond the last one (extrapolated) or inside a resolution
+        # range excluded from the data (ice ring, EXCLUDE_RESOLUTION_RANGE). The limit is then the edge of the data,
+        # the highest-resolution reflection kept on the low-resolution side: the outputs end there and the empty range
+        # must not count as missing reflections. The lattice-merge verdicts compare the fits (cc_half_fit)
+        dfit, why = dcut, "CC1/2 = 0.3 fit"
+        if dcut:
+            d_u = merged["d"]
+            above, below = d_u[d_u >= dcut], d_u[d_u < dcut]
+            gap = [(min(a, b), max(a, b)) for a, b in getattr(self, "_excl_ranges", [])
+                   if below.size and above.size and max(a, b) > below.max() and min(a, b) < above.min()]
+            if above.size and (not below.size or gap):
+                dcut = float(above.min())
+                why = (f"limited by the data: the CC1/2 = 0.3 fit, {dfit:.2f} A, lies in the excluded range "
+                       f"{gap[0][0]:.3f}-{gap[0][1]:.3f} A" if gap else
+                       f"limited by the data: the CC1/2 = 0.3 fit, {dfit:.2f} A, lies beyond the last reflection kept "
+                       f"(detector edge)")
+        dcut, why = self._limit_completeness_input(fine, merged["d"], dcut, dfit, why)
         # statistics inside the chosen limit (the summary reports these; the table above runs to the
         # detector edge)
         if dcut:
             sh_c, ov_c, _ = merging_statistics(hasu[act], plus[act], Is[act], ss[act], cell, sg, nbins=10, dmin=dcut,
                                                anomalous=True)
             self.st.results.update(dict(shells_cut=sh_c, overall_cut=ov_c))
-        self.st.results.update(dict(shells=shells, overall=overall, cc_half_cutoff=dcut, cc_fine=fine,
+        self.st.results.update(dict(shells=shells, overall=overall, cc_half_cutoff=dcut, cc_half_fit=dfit, cc_fine=fine,
                                     n_obs_merged=int(act.sum())))
+        if dfit:
+            self.log(f"  SCALE: isotropic resolution estimate (CC1/2 = 0.3 fit): {dfit:.2f} A")
         if dcut:
-            self.log(f"  SCALE: isotropic resolution estimate (CC1/2 = 0.3 fit): {dcut:.2f} A")
-            self.decide("resolution limit", f"{dcut:.2f} A (CC1/2 = 0.3 fit)")
+            self.decide("resolution limit", f"{dcut:.2f} A ({why})")
         from .analysis import batch_statistics, twinning_analysis
         try:
             tw = twinning_analysis(merged["hkl"], merged["I"], merged["sig"], cell, sg,
-                                   tncs=self.st.results.get("tncs_modulation"))
+                                   tncs=self.st.results.get("tncs_modulation"), dmin=dcut)
             self.log("\n  SCALE: Wilson and twinning statistics")
             for line in tw.lines():
                 self.log("  " + line)
@@ -391,7 +419,6 @@ class ScaleStage:
             # twinning seen by the L-test but not explained by any twin law of this space group: the apparent symmetry
             # may include twin operators
             from .analysis import hidden_twinning_check, l_test_alpha
-            self._hidden_twin = None
             ht = hidden_twinning_check(r["hkl"][act], Is[act], ss[act], cell, sg, tw)
             best_law = max([0.5 * (t[2] + t[4]) for t in tw.twin_laws], default=0.0)
             ht = [t for t in ht if 0.5 * (t[2] + t[3]) >= best_law + 0.1]   # clearly beyond the laws of sg itself
@@ -465,7 +492,7 @@ class ScaleStage:
         self._write_unmerged(self.wd / "xpg_unmerged.mtz", exp, sg, r["hkl"][act], Is[act], ss[act], r["x"][act],
                              r["y"][act], r["z"][act], r["rlp"][act], geometry=True)
         self._write_merged(merged, cell, sg, dcut, g.wavelength, final)
-        self._aniso_statistics(hasu[act], plus[act], Is[act], ss[act], cell, sg)
+        self._aniso_statistics(hasu[act], plus[act], Is[act], ss[act], cell, sg, merged["hkl"])
         if os.environ.get("XPG_BAYES_MERGE", "0") == "1":
             self._write_bayes_merged(hasu[act], Is[act], ss[act], cell, sg, dcut, g.wavelength)
         self.st.results["merged"] = merged
@@ -700,6 +727,45 @@ class ScaleStage:
         if self.p.export_legacy:
             sp.write_legacy_spots(self.wd / "SPOT.XDS")
 
+    def _limit_completeness_input(self, fine, d_u, dcut, dfit, why):
+        """Resolution limit after the CC1/2 one: the completeness limit (merging.completeness_limit on the thin shells
+        to the detector edge, [processing] min_shell_completeness) when it is more conservative: beyond the complete
+        circle on the detector the shells empty out towards the corners, and a CC1/2 limit there gives a Table 1 with
+        barely complete outer shells. Not applied when the input sets a resolution range (resolution /
+        INCLUDE_RESOLUTION_RANGE): those data were asked for, and the CC1/2 limit inside them applies as before.
+        Returns (dcut, why); the limit snaps to the last merged reflection inside it, as the outputs end there."""
+        r = self.st.results
+        r.update(limit_by="cc_half" if dcut == dfit else "data edge", completeness_limit=None)
+        fit_txt = f"CC1/2 = 0.3 fit at {dfit:.2f} A" if dfit else "no CC1/2 = 0.3 fit"
+        frac = float(self.p.min_shell_completeness or 0.0)
+        if frac <= 0 or self.p.include_resolution[1] > 0:
+            return dcut, why
+        try:
+            d_ins = float(self.st.exp.geom.resolution_at_edge_inscribed())
+        except Exception:  # pragma: no cover (beam off the detector)
+            d_ins = None
+        d_ins = d_ins if d_ins and np.isfinite(d_ins) else None
+        cl = completeness_limit(fine, d_ins, frac)
+        if not cl or not cl[0] or (dcut and cl[0] <= dcut):
+            return dcut, why
+        above = d_u[d_u >= cl[0] * (1 - 1e-9)]
+        if not above.size:
+            return dcut, why
+        d_c, plateau, thr, d_from = float(above.min()), cl[1], cl[2], cl[3]
+        corners = " (detector corners)" if d_ins and cl[0] < d_ins else ""
+        cld = dict(d=d_c, plateau=plateau, threshold=thr, fraction=frac, d_inscribed=d_ins)
+        if d_ins and d_from < d_ins:
+            # too few thin shells inside the complete circle: the plateau came from the inner half of the shells
+            cld["d_plateau"] = d_from
+        r.update(limit_by="completeness", completeness_limit=cld)
+        self.log(f"  SCALE: completeness limit {d_c:.2f} A: thin shells beyond it are below {100 * thr:.1f}% complete "
+                 f"({100 * frac:g}% of the {100 * plateau:.1f}% reached at "
+                 + (f"d >= {d_from:.2f} A, the inner half of the shells: too few inside the complete circle on the "
+                    f"detector, d >= {d_ins:.2f} A)" if "d_plateau" in cld else
+                    f"d >= {d_ins:.2f} A, the complete circle on the detector)" if d_ins else "low resolution)"))
+        return d_c, (f"limited by completeness: shells beyond {d_c:.2f} A are below {100 * frac:g}% of the "
+                     f"{100 * plateau:.0f}% low-resolution completeness{corners}; {fit_txt}")
+
     def _plausible_merge_limit(self, n_all):
         """Best CC1/2 = 0.3 limit the all-lattice merge can reach if the extra lattices were independent data of the
         main lattice's quality: k = n_all / n_main times the observations raise CC1/2 per shell to the
@@ -921,19 +987,15 @@ class ScaleStage:
             self._aniso_inside = aniso.pop("inside_hkl")
             self.st.results["aniso"] = aniso
 
-    def _aniso_statistics(self, hasu, plus, I, sig, cell, sg):
+    def _aniso_statistics(self, hasu, plus, I, sig, cell, sg, merged_hkl):
         """Merging statistics of the anisotropic data, the reflections inside the cut-off surface (as in
         xpg_anisotropic.mtz): shells to the best limit with their spherical completeness, and the ellipsoidal
-        completeness overall."""
-        from .aniso import ellipsoidal_completeness
-        from .symops import hkl_key
-        an, inside = self.st.results.get("aniso"), getattr(self, "_aniso_inside", None)
-        if not an or inside is None or len(inside) < 100:
+        completeness overall (outputs.aniso_statistics; the all-lattice merge gets its own the same way)."""
+        an = self.st.results.get("aniso")
+        a = aniso_statistics(hasu, plus, I, sig, cell, sg, merged_hkl, an, getattr(self, "_aniso_inside", None))
+        if a is None:
             return
-        sel = np.isin(hkl_key(hasu), hkl_key(inside))
-        sh, ov, _ = merging_statistics(hasu[sel], plus[sel], I[sel], sig[sel], cell, sg, nbins=10,
-                                       dmin=float(min(an["limits"])), anomalous=True)
-        ec = ellipsoidal_completeness(inside, cell, sg, an["limits"], an["directions_hkl"])
+        sh, ov, ec = a
         self.st.results.update(shells_aniso=sh, overall_aniso=ov, ellipsoidal_completeness=ec[2] if ec else None)
         self.log("\n  SCALE: anisotropic data (inside the cut-off surface, limits " +
                  " / ".join(f"{v:.2f}" for v in an["limits"]) + " A; xpg_anisotropic.mtz)" +
@@ -949,8 +1011,17 @@ class ScaleStage:
                    sigma_d=st.model.sigma_d, sigma_m=st.model.sigma_m,
                    aniso=st.results.get("aniso"), primary_mtz=st.results.get("primary_mtz", "first lattice"),
                    overall=_stats(st.results["overall"]))
+        # Table 1 entries not in the statistics
+        out["wavelength"] = float(st.exp.geom.wavelength)
+        if st.results.get("twinning") is not None:
+            out["wilson_b"] = st.results["twinning"].wilson_b
+        if st.results.get("cc_half_fit") not in (None, st.results.get("cc_half_cutoff")):
+            # cc_half_cutoff is then the data edge or the completeness limit (with completeness_limit)
+            out["cc_half_fit"] = st.results["cc_half_fit"]
+        if st.results.get("completeness_limit"):
+            out["completeness_limit"] = st.results["completeness_limit"]
         if st.results.get("overall_cut") is not None and st.results.get("shells_cut"):
-            # the report's table: overall, inner and outer shell to the CC1/2 = 0.3 limit
+            # the report's table: overall, inner and outer shell to the resolution limit
             sh = st.results["shells_cut"]
             out["statistics"] = dict(overall=_stats(st.results["overall_cut"]), inner=_stats(sh[0]), outer=_stats(sh[-1]))
         if st.results.get("overall_aniso") is not None and st.results.get("shells_aniso"):

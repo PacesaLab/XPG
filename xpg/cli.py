@@ -134,6 +134,11 @@ def main(argv=None):
         (out / "xpg.toml").write_text(params_to_toml(p))
         inp = out / "xpg.toml"
     p = read_input(inp)
+    if p.extra.get("XPG_FROM_HEADER"):
+        print(f"xpg: {inp.name} has no {', '.join(p.extra['XPG_FROM_HEADER'])}: taken from the image header, with "
+              f"the other settings it leaves out")
+        if p.extra.get("XPG_GEOMETRY_NOTE"):
+            print(f"xpg: header geometry: {p.extra['XPG_GEOMETRY_NOTE']}")
     if a.export_legacy:
         p.export_legacy = True
     wd = Path(a.outdir or inp.parent)
@@ -153,7 +158,7 @@ def main(argv=None):
         print(f"xpg: !!! ERROR !!! {e}", file=sys.stderr)
         pipe.log(f"!!! ERROR !!! {e}")
         # resource / library failures (CUDA out of memory, ...) are not data verdicts: keep where they happened
-        if not str(e).startswith(("INDEX:", "indexing failed")) or "out of memory" in str(e):
+        if not str(e).startswith(("DETECTOR:", "SPOTS:", "INDEX:", "indexing failed")) or "out of memory" in str(e):
             import traceback
             tb = traceback.format_exc()
             print(tb, file=sys.stderr)

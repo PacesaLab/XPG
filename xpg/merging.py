@@ -95,7 +95,12 @@ def merging_statistics(hasu, plus, I, sig, cell, sg, nbins=10, dmin=None, dmax=N
         dmin = d.min()
     if dmax is None:
         dmax = d.max() * 1.0001
-    sel = (d >= dmin) & (d <= dmax)
+    # systematic absences are no reflections of the space group (not counted as possible either); the margin keeps a
+    # reflection exactly at dmin (dmin taken from the data) in both the observed and the possible set, whatever the
+    # rounding of the two d computations
+    dlo = dmin * (1 - 1e-9)
+    absent = np.asarray(sg.operations().systematic_absences(np.ascontiguousarray(hasu, dtype=np.int32)), bool)
+    sel = (d >= dlo) & (d <= dmax) & ~absent
     hasu, plus, I, sig, d = hasu[sel], plus[sel], I[sel], sig[sel], d[sel]
     if split_key is not None:
         split_key = np.asarray(split_key, np.int64)[sel]
@@ -167,7 +172,7 @@ def merging_statistics(hasu, plus, I, sig, cell, sg, nbins=10, dmin=None, dmax=N
     d2m[pos_plain[~ip_mask & v2]] = h2a[0][~ip_mask & v2]
     dano1 = d1p - d1m
     dano2 = d2p - d2m
-    possible, dposs, cposs = possible_unique(cell, sg, dmin, dmax)
+    possible, dposs, cposs = possible_unique(cell, sg, dlo, dmax)
     if shell_limits:
         lim = [x for x in sorted(shell_limits, reverse=True) if x < dmax]
         edges = np.array([dmax] + [x for x in lim if x > dmin] + [dmin])
@@ -256,6 +261,32 @@ def cc_half_cutoff(shells_fine, threshold=0.3):
     return float(1.0 / np.sqrt(x))
 
 
+def completeness_limit(shells_fine, d_plateau=None, fraction=0.5):
+    """Resolution limit set by completeness: the high-resolution edge of the outermost thin shell whose completeness
+    reaches fraction x the plateau, the median completeness of the shells at d >= d_plateau (the resolution of the
+    complete circle on the detector; without it, or with fewer than 3 such shells, the inner half of the shells).
+    Relative to the plateau so that data incomplete at every resolution (low symmetry, short sweep) are not cut;
+    scanned from outside in so that dips inside (excluded ice rings) never cut. Returns (d_limit, plateau, threshold,
+    d_from), d_limit None when the outermost shell reaches the threshold (no cut), the plateau from the shells at
+    d >= d_from (d_plateau, or the high-resolution edge of the inner half); None without usable shells."""
+    sh = [s for s in shells_fine if s.n_possible > 0]
+    if len(sh) < 4 or not fraction or fraction <= 0:
+        return None
+    inner = [s for s in sh if d_plateau and s.dmin >= d_plateau]
+    d_from = d_plateau
+    if len(inner) < 3:
+        inner = sh[:max(len(sh) // 2, 1)]
+        d_from = float(inner[-1].dmin)
+    plateau = float(np.median([s.completeness for s in inner]))
+    if plateau <= 0:
+        return None
+    thr = fraction * plateau
+    for i in range(len(sh) - 1, -1, -1):
+        if sh[i].completeness >= thr:
+            return (None if i == len(sh) - 1 else float(sh[i].dmin)), plateau, thr, d_from
+    return None
+
+
 def delta_cc_half_groups(uid, I, group):
     """Delta-CC1/2 (sigma-tau method) of each group of observations (e.g. image ranges): CC1/2 of all data minus CC1/2
     without the group; negative = the group makes the data worse (Assmann et al. 2016; used per image group by
@@ -310,18 +341,27 @@ def delta_cc_half_groups(uid, I, group):
     return groups, out, cc_all
 
 
-def isa_empirical(uid, I, top_fraction=0.02, min_mult=3):
+def isa_empirical(uid, I, top_fraction=0.02, min_mult=3, min_dof=100):
     """Model-free estimate of the systematic-error floor (ISa): 1 / robust sd of the relative deviations
     (I - <I>)/<I> between symmetry mates for the strongest reflections (top ``top_fraction`` by mean
     intensity, multiplicity >= ``min_mult``), where counting noise is negligible. Independent of how a
-    program models its sigmas, so it compares programs fairly (error-model ISa values do not)."""
+    program models its sigmas, so it compares programs fairly (error-model ISa values do not).
+    Low multiplicity: when the selected reflections give fewer than ``min_dof`` independent deviations (n - 1 each;
+    the robust sd has a relative error of ~1.17 / sqrt(dof)), pairs are used as well: the sqrt(n / (n - 1)) factor
+    makes the deviation within a pair unbiased too."""
     uid = np.asarray(uid)
     n = np.bincount(uid)
     m = np.bincount(uid, I) / np.maximum(n, 1)
-    ok = (n[uid] >= min_mult) & (m[uid] > 0)
-    if ok.sum() < 50:
+    sel = None
+    for mm in dict.fromkeys((min_mult, 2)):
+        ok = (n[uid] >= mm) & (m[uid] > 0)
+        if ok.sum() < 50:
+            continue
+        sel = ok & (m[uid] >= np.quantile(m[uid][ok], 1 - top_fraction))
+        if sel.sum() - np.unique(uid[sel]).size >= min_dof:
+            break
+    if sel is None:
         return float("nan")
-    sel = ok & (m[uid] >= np.quantile(m[uid][ok], 1 - top_fraction))
     rel = (I[sel] - m[uid][sel]) / m[uid][sel] * np.sqrt(n[uid][sel] / (n[uid][sel] - 1.0))
     sd = 1.4826 * np.median(np.abs(rel))
     return float(1.0 / sd) if sd > 0 else float("nan")

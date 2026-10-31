@@ -10,10 +10,15 @@ from xpg.symops import d_spacing, rot_matrices
 CELL = np.array([60.0, 60.0, 90.0, 90.0, 90.0, 120.0])     # Niggli-reduced hexagonal cell (reduced = conventional)
 
 
-def observations(spec, dmin=2.2, mult=4.0, sys_err=0.0, noise=1.0, seed=0):
+def observations(spec, dmin=2.2, mult=4.0, sys_err=0.0, noise=1.0, seed=0, drift=0.0, sweep=360.0, drift_len=30.0):
     """Unmerged observations: each unique reflection measured ~mult times at random symmetry-equivalent (true
     group) and Friedel-random indices; multiplicative systematic error sys_err (absorption / damage per
-    observation), Poisson-like noise. Returns hkl (reduced cell), I, sig, s, phi."""
+    observation), Poisson-like noise. Returns hkl (reduced cell), I, sig, s, phi.
+
+    drift > 0: rotation angles as in a sweep of ``sweep`` degrees (the observations of one reflection, h or -h, ~12
+    degrees apart; symmetry mates at unrelated angles) and a systematic error that varies smoothly along the sweep
+    (r.m.s. ``drift`` in log I, correlation length ``drift_len`` degrees; see _drift): repeated measurements share
+    it, distant symmetry mates do not."""
     rng = np.random.default_rng(seed)
     n = int(np.ceil(CELL[0] / dmin)) + 1
     nl = int(np.ceil(CELL[2] / dmin)) + 1
@@ -34,11 +39,33 @@ def observations(spec, dmin=2.2, mult=4.0, sys_err=0.0, noise=1.0, seed=0):
     It = Itrue[idx]
     phi = rng.uniform(0, 360, idx.size)
     corr = np.exp(sys_err * rng.normal(size=idx.size))                       # per-observation systematic error
+    if drift > 0:
+        phi, fd = _drift(h, drift, sweep, drift_len, seed)
+        corr = corr * fd
     bg = 0.05 * np.mean(Itrue)
     sig = noise * np.sqrt(np.maximum(It * corr, 0) + bg)
     I = It * corr + sig * rng.normal(size=idx.size)
     s = 1.0 / d_spacing(h, CELL)
     return h, I, sig, s, phi
+
+
+def _drift(h, drift, sweep, drift_len, seed):
+    """Rotation angles and the systematic error along the sweep (own random stream: the other draws, and so the
+    observations without drift, are unchanged): an overall scale and a resolution-dependent (damage-like) factor,
+    each a smooth random function of phi; the observations of one reflection (h, -h) are ~12 deg apart in phi
+    (Friedel mates, second crossings), symmetry mates anywhere in the sweep."""
+    from xpg.symmetry import _friedel_canon
+    rd = np.random.default_rng(seed + 7919)
+    _, inv = np.unique(_friedel_canon(h), return_inverse=True)
+    phi = rd.uniform(0, sweep, inv.max() + 1)[inv] + rd.normal(0, 12.0, h.shape[0])
+
+    def smooth():       # unit-variance random function of phi (random Fourier features, Gaussian kernel)
+        w, th = rd.normal(0, 1 / drift_len, 64), rd.uniform(0, 2 * np.pi, 64)
+        return np.sqrt(2 / 64) * np.cos(phi[:, None] * w[None] + th[None]).sum(1)
+
+    s2 = 1.0 / d_spacing(h, CELL) ** 2
+    f = smooth() + smooth() * (s2 / s2.mean() - 1)
+    return phi, np.exp(drift * f / f.std())
 
 
 def decide(h, I, sig, s, phi):

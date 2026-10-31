@@ -248,6 +248,8 @@ class IndexStage:
 
     def job_index(self):
         self.log("\n=== INDEX ===")
+        if self.st.spots is None or not len(self.st.spots):
+            raise RuntimeError("INDEX: no spots to index (rerun from SPOTS)")
         try:
             res, err = self._index_with_retries(axis_screen=True), None
         except RuntimeError as e:

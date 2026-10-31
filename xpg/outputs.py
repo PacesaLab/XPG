@@ -64,6 +64,23 @@ def write_merged_outputs(merged, cell, sg, dcut, wavelength, stem: Path, log=pri
         log(f"  ANISO: failed ({e})")
         return None
 
+def aniso_statistics(hasu, plus, I, sig, cell, sg, merged_hkl, aniso, inside):
+    """Merging statistics of the anisotropic data, the observations of the reflections inside the cut-off surface (as
+    in <stem>_anisotropic.mtz; aniso, inside: write_merged_outputs' summary and its inside_hkl): (shells to the best
+    limit with their spherical completeness, overall, ellipsoidal completeness (aniso.ellipsoidal_completeness)), or
+    None without the surface."""
+    from .aniso import ellipsoidal_completeness
+    from .merging import merging_statistics
+    from .symops import hkl_key
+    if not aniso or inside is None or len(inside) < 100:
+        return None
+    sel = np.isin(hkl_key(hasu), hkl_key(inside))
+    sh, ov, _ = merging_statistics(hasu[sel], plus[sel], I[sel], sig[sel], cell, sg, nbins=10,
+                                   dmin=float(min(aniso["limits"])), anomalous=True)
+    # all merged reflections (as the report): the limits are bounded by the resolution of the reflections passed,
+    # and those inside the surface end short of the best limit, which shrank the surface
+    return sh, ov, ellipsoidal_completeness(merged_hkl, cell, sg, aniso["limits"], aniso["directions_hkl"])
+
 def _isotropic_prior(d, I, eps, nbins=30):
     s2 = 1.0 / d ** 2
     edges = np.quantile(s2, np.linspace(0, 1, nbins + 1))

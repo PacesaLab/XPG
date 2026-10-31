@@ -53,8 +53,8 @@ def prepare_model(model, out):
 
 def merge_in(run_dir, sg_alt, out_stem, log=print, reindex=None, cell=None, dmin=None):
     """Merge the run's unmerged data in another space group -> <out_stem>_merged_iso.mtz. Same cell basis unless
-    reindex (integer M, h' = M h) and the new conventional cell are given; cut at the run's CC1/2 limit unless dmin
-    is given."""
+    reindex (M, h' = M h; integral on the reflections the run's centring allows, fractions between centred settings)
+    and the new conventional cell are given; cut at the run's CC1/2 limit unless dmin is given."""
     from .io.xpgfiles import read_unmerged_mtz
     from .merging import merging_statistics
     from .outputs import write_merged_outputs
@@ -62,7 +62,13 @@ def merge_in(run_dir, sg_alt, out_stem, log=print, reindex=None, cell=None, dmin
     run_dir = Path(run_dir)
     u = read_unmerged_mtz(run_dir / "xpg_unmerged.mtz")
     sg = gemmi.SpaceGroup(sg_alt)
-    hkl = u["hkl"] if reindex is None else u["hkl"] @ np.asarray(reindex).T
+    if reindex is None:
+        hkl = u["hkl"]
+    else:
+        hkl = u["hkl"] @ np.asarray(reindex).T
+        if np.abs(hkl - np.rint(hkl)).max() > 1e-6:
+            raise ValueError("reindexing gives non-integer indices")
+        hkl = np.rint(hkl).astype(np.int64)
     cell = np.array(u["cell"] if cell is None else cell, float)
     system = sg.crystal_system_str()
     if system in ("trigonal", "hexagonal"):

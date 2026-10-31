@@ -94,12 +94,28 @@ def start_rerun(base, start, edits="", single_pass=False):
 _PROCS = {}     # reruns started by this server (status without a pid probe)
 
 
+def _browser_json(text):
+    """A run's JSON file for the dashboard: NaN / Infinity, which Python's json writes for non-finite floats (CCano
+    without anomalous pairs, a Wilson B from too few reflections), as null -- browsers reject the whole file otherwise;
+    the text unchanged without them (or when it does not parse, e.g. half written)."""
+    nonfinite = []
+
+    def null(c):
+        nonfinite.append(c)
+        return None
+    try:
+        v = json.loads(text, parse_constant=null)
+    except ValueError:
+        return text
+    return json.dumps(v, indent=1) if nonfinite else text
+
+
 def _summary(d):
     p = d / "xpg_summary.json"
     if not p.exists():
         return {}
     try:
-        s = json.loads(p.read_text())
+        s = json.loads(p.read_text(), parse_constant=lambda c: None)      # NaN / Infinity: see _browser_json
     except ValueError:
         return {}
     o = (s.get("statistics") or {}).get("overall") or s.get("overall") or {}       # to the limit, as in the PDF
@@ -249,22 +265,24 @@ function chart(x,y,ylab,xlab){const W=300,H=120,L=36,B=18,T=6,R=6;const pts=x.ma
  `<polyline class="ln" points="${pts.map(p=>sx(p[0]).toFixed(1)+","+sy(p[1]).toFixed(1)).join(" ")}"/>`+
  `<text class="ax" x="${L-3}" y="${T+8}" text-anchor="end">${f(y1)}</text><text class="ax" x="${L-3}" y="${H-B}" text-anchor="end">${f(y0)}</text>`+
  `<text class="ax" x="${L}" y="${H-4}">${f(x0)}</text><text class="ax" x="${W-R}" y="${H-4}" text-anchor="end">${f(x1)} ${esc(xlab||"")}</text></svg></div>`}
+function limBy(s){return s.completeness_limit?"completeness":s.cc_half_fit?"data edge":"CC½ = 0.3"}
 function result(){const r=new Map(metrics),s=summ||{};
  if(s.space_group)r.set("Space group",s.space_group+(s.space_group_alternatives&&s.space_group_alternatives.length>1?" (also: "+s.space_group_alternatives.filter(g=>g!==s.space_group).join(", ")+")":""));
  if(s.cell)r.set("Cell",s.cell.map((v,i)=>(+v).toFixed(i<3?2:1)).join("  "));
- if(s.cc_half_cutoff)r.set("Resolution",(+s.cc_half_cutoff).toFixed(2)+" Å (CC½ = 0.3)"+(s.aniso&&s.aniso.limits?" · anisotropic "+s.aniso.limits.map(v=>(+v).toFixed(2)).join(" / ")+" Å":""));
+ if(s.cc_half_cutoff)r.set("Resolution",(+s.cc_half_cutoff).toFixed(2)+" Å ("+limBy(s)+")"+(s.aniso&&s.aniso.limits?" · anisotropic "+s.aniso.limits.map(v=>(+v).toFixed(2)).join(" / ")+" Å":""));
  if(s.isa)r.set("ISa",(+s.isa).toFixed(1));if(s.sigma_d)r.set("σD / σM",(+s.sigma_d).toFixed(3)+"° / "+(+s.sigma_m).toFixed(3)+"°");
  if(s.primary_mtz)r.set("Primary output",s.primary_mtz);
  const order=["Space group","Cell","Resolution","ISa","Twinning","tNCS","Primary output","σD / σM","Spots","Indexed","Integrated","Device"];
  const rows=[...r].sort((a,b)=>(order.indexOf(a[0])+99)%99-(order.indexOf(b[0])+99)%99);
  return rows.length?rows.map(([k,v])=>`<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join(""):'<tr><td colspan="2" class="muted">none yet</td></tr>'}
-function stats(){const st=summ&&summ.statistics,sa=summ&&summ.statistics_aniso;if(!st)return'<tr><td class="muted">after SCALE</td></tr>';
- const c=[st.overall,st.inner,st.outer].concat(sa?[sa.overall,sa.outer]:[]);
- const pc=v=>v<=1.5?100*v:v,R=[["Resolution (Å)",s=>nf(s.dmax,2)+"–"+nf(s.dmin,2)],["Unique",s=>(+s.n_uniq).toLocaleString()],["Completeness %",s=>nf(pc(s.completeness),1)],
-  ["Multiplicity",s=>nf(s.multiplicity,1)],["I/σ",s=>nf(s.i_over_sigma,1)],["Rmeas",s=>nf(s.rmeas,3)],["Rpim",s=>nf(s.rpim,3)],["CC½",s=>nf(s.cc_half,3)],["CCano",s=>nf(s.cc_ano,3)]];
- const grp='<tr><th></th><th colspan="3" style="text-align:center">isotropic</th>'+(sa?'<th colspan="2" style="text-align:center">anisotropic</th>':"")+'</tr>';
- const ell=sa&&sa.ellipsoidal_completeness!=null?`<tr><td>Ellipsoidal compl. %</td><td></td><td></td><td></td><td>${nf(100*sa.ellipsoidal_completeness,1)}</td><td></td></tr>`:"";
- return grp+'<tr><th></th><th>overall</th><th>inner</th><th>outer</th>'+(sa?'<th>overall</th><th>outer</th>':"")+'</tr>'+R.map(([k,f])=>`<tr><td>${k}</td>${c.map(s=>`<td>${f(s)}</td>`).join("")}</tr>`).join("")+ell}
+function stats(){const st=summ&&summ.statistics,sa=summ&&summ.statistics_aniso,all=!st&&summ&&summ.overall;
+ if(!st&&!all)return'<tr><td class="muted">after SCALE</td></tr>';
+ const c=(st?[st.overall,st.inner,st.outer]:[all]).concat(sa?[sa.overall,sa.outer]:[]),n=st?3:1;
+ const pc=v=>v!=null&&v<=1.5?100*v:v,R=[["Resolution (Å)",s=>nf(s.dmax,2)+"–"+nf(s.dmin,2)],["Observations",s=>(+s.n_obs).toLocaleString()],["Unique",s=>(+s.n_uniq).toLocaleString()],["Completeness %",s=>nf(pc(s.completeness),1)],
+  ["Multiplicity",s=>nf(s.multiplicity,1)],["I/σ",s=>nf(s.i_over_sigma,1)],["Rmerge",s=>nf(s.rmerge,3)],["Rmeas",s=>nf(s.rmeas,3)],["Rpim",s=>nf(s.rpim,3)],["CC½",s=>nf(s.cc_half,3)],["CCano",s=>nf(s.cc_ano,3)]];
+ const grp=`<tr><th></th><th colspan="${n}" style="text-align:center">${st?"isotropic":"all data"}</th>`+(sa?'<th colspan="2" style="text-align:center">anisotropic</th>':"")+'</tr>';
+ const ell=sa&&sa.ellipsoidal_completeness!=null?`<tr><td>Ellipsoidal compl. %</td>${"<td></td>".repeat(n)}<td>${nf(100*sa.ellipsoidal_completeness,1)}</td><td></td></tr>`:"";
+ return grp+'<tr><th></th><th>overall</th>'+(st?'<th>inner</th><th>outer</th>':"")+(sa?'<th>overall</th><th>outer</th>':"")+'</tr>'+R.map(([k,f])=>`<tr><td>${k}</td>${c.map(s=>`<td>${f(s)}</td>`).join("")}</tr>`).join("")+ell}
 function decis(){const audit=new Map(((summ&&summ.audit_merges)||[]).map(a=>[a.label,a.file]));
  return [...decisions.values()].sort((a,b)=>(b.low_margin?1:0)-(a.low_margin?1:0)).map(d=>{
   const alts=(d.alternatives||[]).map(a=>{const lab=a.replace(/ \(.*$/,""),f=audit.get(lab);return f?`${esc(a)} <a href="/file?name=${encodeURIComponent(f)}${RQ}">${esc(f)}</a>`:esc(a)});
@@ -283,7 +301,8 @@ function render(){
  const now=Date.now()/1000,st=document.getElementById("status");
  st.textContent=run&&run.end?`finished in ${fmt(run.end.seconds)}`:run?`running for ${fmt(now-run.t)}`:"";
  document.getElementById("result").innerHTML=result();
- document.getElementById("stats").innerHTML=stats();document.getElementById("statwhat").textContent=summ&&summ.statistics?"(isotropic: to the CC½ = 0.3 limit; anisotropic: inside the cut-off surface)":"";
+ document.getElementById("stats").innerHTML=stats();document.getElementById("statwhat").textContent=summ&&summ.statistics?"(isotropic: to the "+(limBy(summ)==="CC½ = 0.3"?"CC½ = 0.3 limit":"resolution limit, "+limBy(summ))+"; anisotropic: inside the cut-off surface)":
+  summ&&summ.overall?"(all data: no resolution limit"+(summ.statistics_aniso?"; anisotropic: inside the cut-off surface)":")"):"";
  const dl=decis();document.getElementById("dcard").style.display=dl?"":"none";document.getElementById("decisions").innerHTML=dl;
  document.getElementById("ocard").style.display=files.length?"":"none";
  document.getElementById("files").innerHTML=files.map(f=>`<tr><td><a href="/file?name=${encodeURIComponent(f.name)}${RQ}">${esc(f.name)}</a></td><td class="muted" style="text-align:right">${size(f.size)}</td></tr>`).join("");
@@ -365,7 +384,7 @@ def make_handler(run_dir: Path):
                 return self._send(200, json.dumps({"events": evs, "offset": new}), "application/json")
             if u.path in ("/api/summary", "/api/mr"):
                 p = d / ("xpg_summary.json" if u.path == "/api/summary" else "xpg_mr.json")
-                return self._send(200, p.read_text() if p.exists() else "{}", "application/json")
+                return self._send(200, _browser_json(p.read_text()) if p.exists() else "{}", "application/json")
             if u.path == "/api/files":
                 return self._send(200, json.dumps({"files": output_files(d)}), "application/json")
             if u.path == "/file":

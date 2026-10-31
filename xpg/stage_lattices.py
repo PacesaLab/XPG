@@ -15,6 +15,10 @@ from .models import d_spacing_from_exp
 from .scaling import Scaler
 from .symops import apply_rot, to_asu
 LATTICE_TRIAGE = os.environ.get("XPG_LATTICE_TRIAGE", "1") != "0"
+# largest relative resolution loss (CC1/2 = 0.3 limit) of the all-lattice merge against the main lattice alone: the
+# final-pass verdict, and the margin within which the merge is written to the main lattice's applied limit
+# (run_multiset d_limit_tol, _limit_tol); looser in the triage
+MERGE_TOL = 0.01
 TRIAGE_TOL = 0.05
 # largest mean per-shell CC1/2 loss of the all-lattice merge against the main lattice alone, over the main lattice's
 # shells (to its CC1/2 = 0.3 limit): isomorphous lattices add observations and raise CC1/2, a non-isomorphous one
@@ -23,6 +27,14 @@ CC_LOSS_TOL = 0.05
 TRIAGE_CC_TOL = 0.10
 # the triage merge needs only its CC1/2 resolution limit and exclusions
 TRIAGE_PRIOR = 0.3
+
+
+def _limit_tol(d_lim, d_main):
+    """run_multiset's d_limit_tol: the merge is written to the main lattice's applied limit d_lim also when its CC1/2
+    fit is coarser, as long as it is within the verdict tolerance of the main fit d_main (<= d_lim): exactly the
+    merges the verdict can promote; a coarser one costs resolution and keeps its own cut."""
+    return max(0.0, (1 + MERGE_TOL) * d_main / d_lim - 1) if d_lim and d_main else MERGE_TOL
+
 
 class LatticeStage:
     """Pipeline mixin (see pipeline.Pipeline)."""
@@ -56,7 +68,7 @@ class LatticeStage:
         self.st.indexing.extra_lattices = []
         self.st.results["extra_refl"] = {}
 
-    def _merge_verdict(self, d_all, d_main, n_all, tol=0.01, cc_loss=None, cc_tol=CC_LOSS_TOL):
+    def _merge_verdict(self, d_all, d_main, n_all, tol=MERGE_TOL, cc_loss=None, cc_tol=CC_LOSS_TOL):
         """(keep, reason, margin) for the merge of all lattices: kept unless it costs resolution (CC1/2 = 0.3 limit,
         tolerance tol), lowers CC1/2 at equal resolution (cc_loss: mean per-shell loss, tolerance cc_tol) or claims
         more than the observations can reach."""
@@ -143,11 +155,20 @@ class LatticeStage:
             ref = self._lattice_report(files, cell, sg)
             inp += [f"INPUT_FILE={'*' if i == ref else ''}{f}" for i, f in enumerate(files)]
             self.log(f"  LATTICES: merging all lattices ({', '.join(files)})")
+            r = self.st.results
+            # the main lattice's limit when it is not its CC1/2 fit (data edge, completeness) bounds the merged
+            # outputs too, also when the merge's fit is coarser but within the verdict tolerance of the main fit
+            # (_limit_tol): a promoted merge then ends where the reports and the deposition CIF say. The verdicts
+            # compare the fits; the main lattice's applied limit stands in when it has none
+            d_lim = (r.get("cc_half_cutoff") if not triage and r.get("limit_by") in ("data edge", "completeness")
+                     else None)
+            d_main = r.get("cc_half_fit") or r.get("cc_half_cutoff")
             res = run_multiset(self.wd / "xpg_lattices", self.wd, log=self.log, anisotropy=self.anisotropy,
                              reject_nonisomorphous="worst", inp_text="\n".join(inp) + "\n",
                              export_legacy=self.p.export_legacy and not triage, stop_at_reference=triage,
                              prior=TRIAGE_PRIOR if triage else None,
-                             compare_shells=self.st.results.get("shells_cut"))
+                             compare_shells=self.st.results.get("shells_cut"), d_limit=d_lim,
+                             d_limit_tol=_limit_tol(d_lim, d_main))
             r_all = (res or {}).get("xpg_all_lattices") or {}
             cc = self._cc_half_loss(r_all)
             if cc is not None:
@@ -155,12 +176,16 @@ class LatticeStage:
                          + " ".join(f"{x:.3f}/{y:.3f}" for x, y in zip(cc[1], cc[2]))
                          + f" (mean loss {cc[0]:+.3f})")
             if triage:
-                # every extra lattice excluded from the merge (Delta-CC1/2 outliers): the 'merge' is the main lattice
-                # alone and costs nothing, but the extra lattices contribute nothing either
+                # every extra lattice excluded from the merge (Delta-CC1/2 outliers, no common structure): the 'merge'
+                # is the main lattice alone and costs nothing, but the extra lattices contribute nothing either. The
+                # main lattice excluded (an extra lattice is the reference): the merge cannot replace it in the final
+                # pass either
                 exc = {Path(f).name for f in (r_all.get("excluded") or [])}
                 if len(files) > 1 and set(files[1:]) <= exc:
                     return False, "every extra lattice excluded from the merge (Delta-CC1/2)"
-                keep, reason, _m = self._merge_verdict(r_all.get("cc_half_cutoff"), self.st.results.get("cc_half_cutoff"),
+                if files[0] in exc:
+                    return False, "main lattice excluded from the merge (Delta-CC1/2)"
+                keep, reason, _m = self._merge_verdict(r_all.get("cc_half_cutoff"), d_main,
                                                        r_all.get("n_obs"), tol=TRIAGE_TOL,
                                                        cc_loss=cc[0] if cc else None, cc_tol=TRIAGE_CC_TOL)
                 return keep, reason
@@ -176,15 +201,24 @@ class LatticeStage:
                     self.st.results["primary_mtz"] = "first lattice (every extra lattice excluded from the merge)"
                     self.decide("lattice merge", "main lattice only (every extra lattice excluded from the merge)")
                     return
-            self._promote_lattice_merge(r_all.get("cc_half_cutoff"), self.st.results.get("cc_half_cutoff"),
-                                        r_all.get("n_obs"), cc)
+                if files[0] in exc:
+                    # the merge holds extra lattices only: not the data the statistics and reports describe
+                    self.log("  LATTICES: the main lattice was excluded from the merge (Delta-CC1/2): the main lattice "
+                             "stays the primary output (extra lattices only: xpg_all_lattices_*.mtz)")
+                    self.st.results["primary_mtz"] = "first lattice (main lattice excluded from the merge)"
+                    self.decide("lattice merge", "main lattice only (main lattice excluded from the merge)")
+                    return
+            self._promote_lattice_merge(r_all.get("cc_half_cutoff"), d_main, r_all.get("n_obs"), cc, r_all=r_all)
         elif triage:
             return False, "no extra lattice compatible with the main lattice"
 
-    def _promote_lattice_merge(self, d_all=None, d_main=None, n_all=None, cc=None):
+    def _promote_lattice_merge(self, d_all=None, d_main=None, n_all=None, cc=None, r_all=None):
         """The all-lattice merge becomes the primary MTZ output when it costs no resolution; the first lattice alone
         is kept as xpg_lattice1_*.mtz and xpg_all_lattices_unmerged.mtz holds all of them. XPG_LATTICES_PRIMARY=0:
-        the first lattice stays primary."""
+        the first lattice stays primary. r_all: run_multiset's result; when the merge was written to the main
+        lattice's applied limit (d_written: data edge, completeness), the statistics reported to that limit become
+        the merge's (isotropic and anisotropic, Wilson B), so the reports, the primary MTZ and the deposition CIF
+        describe the same data."""
         import shutil
         if os.environ.get("XPG_LATTICES_PRIMARY", "1").upper() in ("0", "F", "FALSE", "N", "NO", "OFF"):
             return
@@ -211,9 +245,10 @@ class LatticeStage:
         d_best = self._plausible_merge_limit(n_all)
         if reason == "implausible":
             self.log(f"  LATTICES: the merge of all lattices claims {d_all:.2f} A, beyond the {d_best:.2f} A that "
-                     f"{n_all / self.st.results['n_obs_merged']:.1f}x the observations of the main lattice ({d_main:.2f} A) "
-                     f"could reach (correlated errors between overlapping lattices): the main lattice stays the "
-                     f"primary output (all lattices: xpg_all_lattices_*.mtz)")
+                     f"{n_all / self.st.results['n_obs_merged']:.1f}x the observations of the main lattice "
+                     f"({f'{d_main:.2f} A' if d_main else 'no CC1/2 = 0.3 limit'}) could reach (correlated errors "
+                     f"between overlapping lattices): the main lattice stays the primary output (all lattices: "
+                     f"xpg_all_lattices_*.mtz)")
             self.st.results["primary_mtz"] = "first lattice (all-lattice merge implausible)"
             self.decide("lattice merge", "main lattice only (merge claims more resolution than possible)",
                         margin=d_best / d_all - 1, unit="relative excess", low=d_all > 0.93 * d_best,
@@ -228,6 +263,23 @@ class LatticeStage:
                 p.replace(self.wd / f"xpg_lattice1_{x}")
             if a.exists():
                 shutil.copyfile(a, p)
+        if r_all and r_all.get("d_written") and r_all.get("shells_compare") and r_all.get("overall_compare"):
+            # merge cut at the main lattice's limit: its statistics on the main lattice's shells (the same limit) are
+            # those of the primary MTZ; the full-range ones those of the primary xpg_unmerged.mtz
+            r = self.st.results
+            r.update(shells_cut=r_all["shells_compare"], overall_cut=r_all["overall_compare"], shells=r_all["shells"],
+                     overall=r_all["overall"])
+            # the anisotropic columns too (xpg_anisotropic.mtz is the merge's now; none when the merge has no
+            # surface), the merged reflections of the report's ellipsoidal completeness and Table 1's Wilson B; the
+            # twinning diagnostics stay the main lattice's
+            r.update({k: r_all.get(k) for k in ("aniso", "shells_aniso", "overall_aniso", "ellipsoidal_completeness",
+                                                "merged")})
+            if r.get("twinning") is not None and "wilson_b" in r_all:
+                import dataclasses
+                r["twinning"] = dataclasses.replace(r["twinning"], wilson_b=r_all["wilson_b"],
+                                                    wilson_dmin=r_all["wilson_dmin"])
+            self.log(f"  LATTICES: the merge is cut at {r_all['d_written']:.2f} A (the main lattice's limit, "
+                     f"{self.st.results.get('limit_by')}, applies to it too); the statistics reported are the merge's")
         self.st.results["primary_mtz"] = "all lattices"
         self.decide("lattice merge", "all lattices merged", margin=(1 - d_all / d_main) if d_all and d_main else None,
                     unit="relative resolution gain", low=bool(d_all and d_main) and abs(d_all / d_main - 1) < 0.01,
@@ -273,7 +325,8 @@ class LatticeStage:
         bad = [f"{i + 1}-{j + 1}" for (i, j), k in iso["kappa"].items() if np.nanmin(np.r_[k, np.inf]) < 0.7]
         if bad:
             self.log(f"  LATTICES WARNING: non-isomorphous pairs (kappa < 0.7 in some shell): {', '.join(bad)}; all "
-                     "lattices are merged ; separate files are kept for inspection")
+                     "lattices are merged and the merge is compared with the main lattice alone; separate files are "
+                     "kept for inspection")
         return ref
 
     def _correct_extra_lattice(self, r, exp_k, sg, label):

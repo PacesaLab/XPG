@@ -330,8 +330,21 @@ class IntegrateStage:
                              f"defaults sigma_D {model.sigma_d:.3f}, sigma_M {model.sigma_m:.3f} deg used "
                              f"(set [processing] beam_divergence / reflecting_range if known)")
                 self.st.results["width_history"] = list(getattr(model, "history", []))
+                # pass 1 integrated with the default widths: the second pass starts from its per-block fits (only
+                # then: a checkpoint written after pass 2 holds pass 2's fits under the same keys)
+                self.st.results["pass1_default_widths"] = not second and not self.st.results["width_history"]
         else:
             model = self.st.model
+            bw = self._pass1_block_widths()
+            if bw is not None:
+                # as from a sweep-wide estimate: box, phi binning, neighbour masks, anchor of the per-block refits
+                model = IntegrationModel(sigma_d=bw[0] if self.p.beam_divergence is None else model.sigma_d,
+                                         sigma_m=bw[1] if self.p.reflecting_range is None else model.sigma_m,
+                                         gain=model.gain)
+                self.log(f"  INTEGRATE: spot widths from the pass-1 per-block fits (median of {bw[2]} blocks; the "
+                         f"sweep-wide estimate found no isolated strong spots): sigma_D {model.sigma_d:.4f}, sigma_M "
+                         f"{model.sigma_m:.4f} deg")
+            self.st.results["pass1_default_widths"] = False
         self.st.model = model
         t_est = time.time() - t_stage
         t_blk0 = time.time()
@@ -387,7 +400,8 @@ class IntegrateStage:
         # block's sigma_D; the forward model needs both)
         self.st.results["integration_block_params"] = {
             int(k): dict(sigma_d=float(v["sigma_d"]), sigma_m=float(v["sigma_m"]),
-                         rcw=[float(x) for x in v.get("rcw", [])]) for k, v in bp.items()}
+                         rcw=[float(x) for x in v.get("rcw", [])], n=int(v.get("n", 0)),
+                         **{f: float(v[f]) for f in ("sigma_d_fit", "sigma_m_fit") if f in v}) for k, v in bp.items()}
         if extra_blocks:
             n_ov = int(np.sum(refl["overlap"] & (refl["lattice"] >= 0)))
             self.log(f"  INTEGRATE: {n_ov} reflections had an overlapping neighbour and were deconvoluted")
@@ -609,18 +623,39 @@ class IntegrateStage:
         joint = bool(extra) and os.environ.get("XPG_FM_MULTI_LATTICE", "0") == "1"
         return frac is not None and frac >= FM_AUTO_OVERLAP and (not extra or joint)
 
+    def _pass1_block_widths(self):
+        """(sigma_D, sigma_M, n blocks) for the second pass when pass 1 found no isolated strong spot (crowded data)
+        and integrated with the default widths: the median of pass 1's per-block fits, which are measured on all
+        strong spots with their neighbours masked (main lattice; checkpoints without the fits: the widths the blocks
+        used). None when the sweep-wide estimate succeeded or was not needed, no block was fitted, or the current
+        integration is already a second pass (checkpoints from before the flag: the width history alone)."""
+        r = self.st.results
+        bp1 = r.get("integration_block_params") or {}
+        if not bp1 or not r.get("pass1_default_widths", r.get("width_history") == []) or \
+                (self.p.beam_divergence is not None and self.p.reflecting_range is not None):
+            return None
+        n_main = len(self.st.results.get("integration_blocks") or [])
+        pb = np.array([(v.get("sigma_d_fit", v["sigma_d"]), v.get("sigma_m_fit", v["sigma_m"]))
+                       for k, v in bp1.items() if k < n_main and ("sigma_m_fit" in v or "n" not in v)])
+        if not len(pb):
+            return None
+        sd1, sm1 = np.median(pb, axis=0)
+        return float(sd1), float(sm1), len(pb)
+
     def _pass2_needed(self, max_xy=0.5, max_z=0.3):
         """--pass2 auto: the second pass (post-refined geometry, adapted widths) is skipped only when the pass-1
-        predictions of strong reflections are already within max_xy spot sigma / max_z rocking sigma (median) and
-        the data have a single lattice."""
+        predictions of strong reflections are already within max_xy spot sigma / max_z rocking sigma (median), the
+        data have a single lattice and pass 1 did not fall back to the default spot widths."""
         pe = self.st.results.get("prediction_error_pass1")
         idx = self.st.indexing
         multi = bool(idx is not None and (getattr(idx, "extra_lattices", None) or getattr(idx, "domains", None)))
         if pe is None:
             self.log("  DECISION second pass: on (no pass-1 prediction error measured)")
             return True
-        need = multi or pe[0] > max_xy or pe[1] > max_z
+        widths = self._pass1_block_widths() is not None
+        need = multi or widths or pe[0] > max_xy or pe[1] > max_z
         self.log(f"  DECISION second pass: {'on' if need else 'skipped'} (pass-1 prediction error {pe[0]:.3f} spot sigma "
                  f"/ {pe[1]:.3f} rocking sigma; limits {max_xy} / {max_z}; "
-                 f"{'several lattices / domains' if multi else 'one lattice'})")
+                 f"{'several lattices / domains' if multi else 'one lattice'}"
+                 + ("; pass 1 used the default spot widths" if widths else "") + ")")
         return need

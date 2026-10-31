@@ -118,7 +118,9 @@ def _split_merged(z, y, x, v, b, lab, nx, ny, min_sep_xy=2.0, nsig=3.0):
     multi = np.flatnonzero(npk >= 2)
     if multi.size == 0:
         return lab
-    new = lab.astype(np.int64) * 4096
+    sub = np.zeros(n, np.int64)         # 1 + index of the pixel's spot in a split cluster, 0 elsewhere
+    nk_max = 0
+    thr_v = nsig * np.sqrt(np.maximum(v, np.float32(1.0)))
     from scipy.spatial import cKDTree
     # pixels and peaks grouped by cluster once (a scan of all pixels per cluster was quadratic)
     by_lab = np.argsort(lab, kind="stable")
@@ -139,7 +141,6 @@ def _split_merged(z, y, x, v, b, lab, nx, ny, min_sep_xy=2.0, nsig=3.0):
         # tested along the 3D path, and a path pixel missing from the strong set means it reaches background.
         # Vectorised over the higher peaks already kept (one Python call per pair was SPOTS's bottleneck), in
         # chunks of bounded size: an all-pairs evaluation ran out of memory on huge clusters (ice rings, streaks).
-        thr_v = nsig * np.sqrt(np.maximum(v, np.float32(1.0)))
         chunk = max(1, 4_000_000 // max(pix.size, 1))
 
         def separated_from_all(q, rs):
@@ -230,8 +231,11 @@ def _split_merged(z, y, x, v, b, lab, nx, ny, min_sep_xy=2.0, nsig=3.0):
         kp = kept[:nk]
         tree = cKDTree(np.c_[x[kp], y[kp], z[kp] * 1.5])
         _, ia = tree.query(np.c_[x[pix], y[pix], z[pix] * 1.5])
-        new[pix] = c * 4096 + 1 + ia
-    return new
+        sub[pix] = 1 + ia
+        nk_max = max(nk_max, nk)
+    # labels c * stride + sub: the stride exceeds every split's spot count (a cluster split into more spots, an ice
+    # ring on every frame, would otherwise take labels of the next clusters and np.unique would merge their spots)
+    return lab.astype(np.int64) * max(4096, nk_max + 1) + sub
 
 
 class _Accumulator:

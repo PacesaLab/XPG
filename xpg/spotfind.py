@@ -263,8 +263,11 @@ def find_spots(images, frames, gain=1.0, mask=None, strong_pixel=3.0, background
             # say how far it is instead of waiting silently
             while not finished(60.0):
                 if verbose:
-                    log(f"  SPOTS: clustering, {clustered()}/{len(frames)} frames "
-                        f"({time.time() - t_read:.0f}s after the last frame)")
+                    n = clustered()
+                    # every batch clustered: the clusters still open (block edges, a ring) are closed and split last
+                    what = (f"clustering, {n}/{len(frames)} frames" if n < len(frames) else
+                            f"all {n} frames clustered, closing and splitting the remaining clusters")
+                    log(f"  SPOTS: {what} ({time.time() - t_read:.0f}s after the last frame)")
         if proc is not None:
             child_started(wait=True)
         if proc is None:

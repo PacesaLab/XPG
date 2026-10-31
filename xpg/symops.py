@@ -28,6 +28,26 @@ def apply_rot(h: np.ndarray, R: np.ndarray) -> np.ndarray:
     return h2 if np.issubdtype(h2.dtype, np.integer) else np.rint(h2).astype(np.int64)
 
 
+def centring_reindex(T, sg, tol=0.05):
+    """Index transformation h' = M h from an approximate T (e.g. inv(A*_alt) A*), exact for the reflections the
+    centring of sg allows, or None. Between centred settings of one lattice M has fractions 1/n, n the number of
+    centring translations (two C cells of a hexagonal lattice: +-1/2, +-3/2); M is accepted when it is within tol of T
+    and maps every allowed index in -2..2 (a generating set of that lattice for every centring) to integers. Integer
+    dtype when M is integral."""
+    sg = as_spacegroup(sg)
+    cen = np.array(sg.operations().cen_ops, dtype=np.int64)
+    n = len(cen)
+    M = np.round(n * np.asarray(T, float)) / n
+    if np.abs(M - T).max() > tol:
+        return None
+    g = np.stack(np.meshgrid(*[np.arange(-2, 3)] * 3, indexing="ij"), -1).reshape(-1, 3)
+    g = g[((g @ cen.T) % gemmi.Op.DEN == 0).all(axis=1)]
+    hp = g @ M.T
+    if np.abs(hp - np.rint(hp)).max() > 1e-9:
+        return None
+    return np.rint(M).astype(np.int64) if np.allclose(M, np.rint(M)) else M
+
+
 def rot_matrices(sg) -> np.ndarray:
     """Point-group rotation matrices (nops, 3, 3) acting on hkl row vectors: h' = h @ R."""
     sg = as_spacegroup(sg)

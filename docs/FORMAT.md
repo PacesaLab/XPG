@@ -59,8 +59,10 @@ resolution = [50.0, 1.6]
 prune_image_groups = false
 ```
 
-Everything is optional except `data.images`. Lengths are in mm on the detector and in Å in the crystal, angles in
-degrees and detector positions in pixels. Vectors are in the laboratory frame and don't need to be unit length.
+Everything is optional except `data.images`. A file without the full experiment description (frames, beam,
+goniometer, detector geometry) is completed from the image header as `xpg --images` writes it; the values it gives
+win. Lengths are in mm on the detector and in Å in the crystal, angles in degrees and detector positions in pixels.
+Vectors are in the laboratory frame and don't need to be unit length.
 
 ### `[data]`
 
@@ -154,6 +156,7 @@ refined: `refine_index`, `refine_integrate` and `refine_scale` take lists of `BE
 | `wfac1` [1.0] | outlier threshold factor |
 | `nbatch` [auto] | number of scale batches (auto: one per 5 deg) |
 | `fixed_scale_range` [none] | `[first, last, factor]` frames whose scale is fixed |
+| `min_shell_completeness` [0.5] | the isotropic resolution limit stops where thin shells fall below this fraction of the completeness reached at low resolution (inside the complete circle on the detector), when that is more conservative than CC1/2 = 0.3; 0 = off. Not applied when `resolution` sets a range |
 | `prune_image_groups` [true] | remove image ranges that lower CC1/2 |
 | `prune_chunks` [true] | remove 5% chunks of the sweep that lower the high-resolution CC1/2 |
 | `prune_fitness_threshold` [0.3] | remove stretches with I/sigma below this fraction of the median (0 = off) |
@@ -231,7 +234,7 @@ The refined experiment, written next to every unmerged MTZ so that the MTZ is al
 
 | File | Content |
 |---|---|
-| `xpg_summary.json` | space group and alternatives, cell, ISa, resolution limit, anisotropy, error model, the merging statistics (`statistics`: overall, inner and outer shell to the CC1/2 limit, as in the reports; `statistics_aniso`: the same inside the anisotropic surface, with the ellipsoidal completeness; `overall`: all data to the detector edge, as in xpg_unmerged.mtz) and `pathologies` (`tncs`: Patterson peak ratio, vector, distance; `twinning`: L-test and every twin law with its H-test and Britton fractions; `hidden_twin`) |
+| `xpg_summary.json` | space group and alternatives, cell, ISa, resolution limit (`cc_half_cutoff`: where CC1/2 = 0.3, or the edge of the kept data when the fit lies beyond the last reflection kept or in an excluded resolution range, or the completeness limit (`completeness_limit`: limit, plateau and threshold completeness, `min_shell_completeness`, the complete circle on the detector the plateau is taken inside, `d_plateau` when too few shells lie inside it and the inner half of the shells is used) when it is more conservative; the fit is then in `cc_half_fit`), wavelength, Wilson B (`wilson_b`), anisotropy, error model, the merging statistics (`statistics`: overall, inner and outer shell to the resolution limit, as in the reports; `statistics_aniso`: the same inside the anisotropic surface, with the ellipsoidal completeness; `overall`: all data to the detector edge, as in xpg_unmerged.mtz) and `pathologies` (`tncs`: Patterson peak ratio, vector, distance; `twinning`: L-test and every twin law with its H-test and Britton fractions; `hidden_twin`) |
 | `xpg_mr.json` | one entry per data set searched (space group, copies, tNCS pairs, TFZ, LLG, R and R-free of the placed model, the `pathologies` MR found and used, the twin fraction refined against the model) and `choice`, the data set and space group picked |
 | `events.jsonl` | one JSON object per line: `t` (time), `type` (`run_start`, `stage_start`, `stage_end`, `log`, `metric`, `decision`, `flag`, `run_end`) and `stage`; the dashboard and the PDF read it |
 | `xpg_spots.txt` | strong spots: `x y frame intensity` and, once indexed, `h k l` |

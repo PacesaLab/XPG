@@ -87,7 +87,7 @@ stage it affects, or use the rerun form in the dashboard.
 
 | File | Content |
 |---|---|
-| `xpg_merged_iso.mtz` | merged data to the isotropic CC1/2 = 0.3 limit: I, F (French-Wilson), anomalous columns, free-R flags |
+| `xpg_merged_iso.mtz` | merged data to the isotropic resolution limit (CC1/2 = 0.3, or where the shells become incomplete towards the detector corners: `min_shell_completeness`): I, F (French-Wilson), anomalous columns, free-R flags |
 | `xpg_anisotropic.mtz` | merged data inside the anisotropic cut-off surface, with anisotropic French-Wilson amplitudes |
 | `xpg_unmerged.mtz` + `xpg_geometry.json` | scaled unmerged data and the refined geometry |
 | `xpg_report.pdf` | two-page summary: key numbers, a diffraction image, statistics, what to check, graphs, MR |
@@ -117,7 +117,9 @@ The statistics of the isotropic and the anisotropic data are reported side by si
 have a single lattice.
 
 **Crowded data.** `XPG_INTEGRATE_MODE=auto` (the default) switches to the pixel-level forward model when at least
-half of the reflections overlap with a neighbour. `fm` forces it, `shoebox` turns it off.
+half of the reflections overlap with a neighbour. `fm` forces it, `shoebox` turns it off. When no strong spot is
+isolated enough to measure the spot widths before integration, the first pass uses default widths and the second
+pass starts from the widths the first pass measured block by block.
 
 **Several lattices.** Other crystals in the beam and split crystals are indexed one after the other and integrated
 together. A lattice is kept only if merging it doesn't cost resolution. If the merge of all lattices is better, it
@@ -181,8 +183,10 @@ prune_image_groups = false
 
 The switches you are most likely to need, all in `[processing]` (default in brackets): `prune_image_groups` [true],
 `prune_chunks` [true], `prune_fitness_threshold` [0.3], `extra_lattices` [true], `min_lattice_separation` [0.5 deg],
-`ice_validate` [true], `zero_dose` [false], `strong_pixel` [3], `min_pixels_per_spot` [6]. XPG refuses keys it
-doesn't know, so a typo can't go unnoticed. All sections, keys and defaults are in [FORMAT](FORMAT.md).
+`ice_validate` [true], `zero_dose` [false], `min_shell_completeness` [0.5: the resolution limit stops where thin
+shells reach less than half the low-resolution completeness; 0 = off], `strong_pixel` [3], `min_pixels_per_spot` [6].
+XPG refuses keys it doesn't know, so a typo can't go unnoticed. All sections, keys and defaults are in
+[FORMAT](FORMAT.md).
 
 ## 7. Environment variables
 

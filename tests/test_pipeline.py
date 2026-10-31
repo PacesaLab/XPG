@@ -134,3 +134,41 @@ def test_integration_memory_passes(tmp_path, monkeypatch):
     assert ok.mean() > 0.95 and np.array_equal(np.isfinite(a["iprf"]), np.isfinite(b["iprf"]))
     d = np.abs(np.asarray(a["iprf"])[ok] - np.asarray(b["iprf"])[ok]) / np.sqrt(np.asarray(a["vprf"])[ok])
     assert np.median(d) < 0.1
+
+
+def test_pass2_widths_from_block_fits(tmp_path, monkeypatch):
+    """Pass 1 without a sweep-wide spot-width estimate (crowded data: no isolated strong spot) integrates with the
+    default widths; the second pass is then always run (--pass2 auto) and starts from the median of pass 1's
+    per-block fits, not from the defaults again."""
+    import pickle
+    from xpg import stage_integrate
+    spec = SimSpec(cell=(41.3, 52.7, 60.1, 90, 90, 90), space_group="P 21 21 21", nx=512, ny=540, orgx=255.3,
+                   orgy=270.6, distance=90.0, osc=0.5, nframes=80, dmin=2.2, gaps=False, mean_i0=8000.0, seed=16,
+                   sigma_d=0.04, sigma_m=0.18)
+    simulate(tmp_path, spec, verbose=False)
+    p = read_input(tmp_path / "xpg.toml")
+
+    def no_isolated_spots(images, exp, model, *a, **k):      # what the estimator returns when no spot is usable
+        model.history = []
+        return model
+    monkeypatch.setattr(stage_integrate, "estimate_sigmas", no_isolated_spots)
+    run = tmp_path / "run"
+    run.mkdir()
+    st = Pipeline(p, workdir=run, log=Logger(run / "test.log", echo=False), second_pass="auto").run()
+    with open(run / "state_SCALE.pkl", "rb") as fh:             # pass 1
+        bp1 = pickle.load(fh)["results"]["integration_block_params"]
+    fits = np.array([(v["sigma_d_fit"], v["sigma_m_fit"]) for v in bp1.values() if "sigma_m_fit" in v])
+    assert len(fits) >= 3
+    assert np.allclose([st.model.sigma_d, st.model.sigma_m], np.median(fits, axis=0))
+    log = (run / "test.log").read_text()
+    assert "pass 1 used the default spot widths" in log and "spot widths from the pass-1 per-block fits" in log
+    assert abs(st.model.sigma_m - spec.sigma_m) < 0.5 * abs(0.25 - spec.sigma_m)
+    assert abs(st.model.sigma_d - spec.sigma_d) < 0.5 * abs(0.05 - spec.sigma_d)
+    # a SCALE-only rerun starts from the pass-2 checkpoint: its fits are not taken for pass 1's, so the second
+    # pass is not forced again, and if it runs it keeps the widths of the first run's second pass
+    with open(run / "state_INTEGRATE.pkl", "rb") as fh:
+        assert pickle.load(fh)["results"]["pass1_default_widths"] is False
+    st2 = Pipeline(p, workdir=run, log=Logger(run / "rerun.log", echo=False), second_pass="auto").run(["SCALE"])
+    log2 = (run / "rerun.log").read_text()
+    assert "pass 1 used the default spot widths" not in log2 and "spot widths from the pass-1 per-block fits" not in log2
+    assert (st2.model.sigma_d, st2.model.sigma_m) == (st.model.sigma_d, st.model.sigma_m)

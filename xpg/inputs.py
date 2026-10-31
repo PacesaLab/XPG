@@ -1,6 +1,8 @@
 """XPG input file (``xpg.toml``) and conversion of other programs' input files.
 
-``xpg.toml`` sections and keys (all optional except ``data.images``; units: pixels, mm, degrees, Angstrom):
+``xpg.toml`` sections and keys (all optional except ``data.images``; units: pixels, mm, degrees, Angstrom). A file
+without the full experiment description (frames, beam, goniometer, detector geometry) is completed from the image
+header as ``xpg --images`` writes it; its own values win:
 
     [data]        images (template with ???? or an HDF5 master file), frames = [first, last], exclude_frames = [[a, b]],
                   spot_frames, background_frames, starting_frame, starting_angle, oscillation
@@ -53,6 +55,7 @@ FORMAT = 1           # layout version, written as "format = 1"; files without it
 _ALWAYS = {"name_template", "data_range", "wavelength", "nx", "ny", "qx", "qy", "orgx", "orgy", "distance", "osc",
            "starting_angle", "rotation_axis", "beam_direction", "ed1", "ed2", "detector"}
 _SKIP = {"workdir", "extra", "segments", "jobs", "lib"}
+_FROM_FRAMES = {"spot_range", "background_range", "starting_frame", "starting_angle"}   # follow the final frame range
 
 
 def _attr_to_key():
@@ -93,7 +96,7 @@ def read_toml(path) -> Params:
     fmt = doc.pop("format", 1)
     if not isinstance(fmt, int) or fmt > FORMAT:
         raise ValueError(f"{path}: format {fmt!r}: this XPG reads format {FORMAT} and older (update XPG)")
-    unknown = []
+    unknown, given = [], set()
     for sec, tab in doc.items():
         if not isinstance(tab, dict) or sec not in SECTIONS:
             unknown.append(sec)
@@ -106,9 +109,35 @@ def read_toml(path) -> Params:
                 unknown.append(f"{sec}.{k}")
                 continue
             setattr(p, attr, _coerce(attr, v, getattr(p, attr)))
+            given.add(attr)
     if unknown:
         raise ValueError(f"{path}: unknown settings {', '.join(unknown)} (see docs/FORMAT.md)")
+    if not p.name_template:
+        raise ValueError(f"{path}: [data] images is required")
+    if _ALWAYS - given:
+        try:
+            _complete_from_header(p, given)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"{path}: {e} (the settings the file leaves out are read from the image header)") from e
+    if not p.spot_range:              # default: all frames
+        p.spot_range = [p.data_range]
     return p          # relative image paths resolve against the input file's directory (workdir)
+
+
+def _complete_from_header(p: Params, given):
+    """Settings an incomplete xpg.toml leaves out, from the image header as ``xpg --images`` sets them."""
+    from .io.images import resolve_template
+    from .setup import params_from_images
+    h = params_from_images(resolve_template(p.name_template, p.workdir), p.workdir)
+    for f in dataclasses.fields(Params):
+        if f.name not in given and f.name not in _SKIP and f.name not in _FROM_FRAMES:
+            setattr(p, f.name, getattr(h, f.name))
+    if "starting_angle" not in given:            # the header's start angle is that of its first frame
+        if "starting_frame" not in given:
+            p.starting_frame = h.starting_frame
+        p.starting_angle = h.starting_angle + (p.starting_frame - h.starting_frame) * p.osc
+    p.extra["XPG_FROM_HEADER"] = [k for a, (_, k) in _attr_to_key().items() if a in _ALWAYS and a not in given]
+    p.extra["XPG_GEOMETRY_NOTE"] = h.extra.get("XPG_GEOMETRY_NOTE", "")
 
 
 def _toml_value(v):
