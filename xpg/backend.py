@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sys
 import threading
 
 import numpy as np
@@ -153,12 +154,16 @@ def compiled(fn, name="kernel", dev=None, devices=("cpu", "mps"), dynamic=False)
     """``torch.compile`` (fuses the elementwise passes of an image kernel: 2x CPU, 6x MPS) with a fallback to eager
     execution if compilation is unavailable or fails (no C++ compiler / Triton). Only for ``devices``: on CUDA the
     eager kernels are already memory-bound at a few ms per frame and compiling (10-200 s on a busy node) does not pay.
+    Eager on the macOS CPU too: a fused kernel loads a bool temporary one vector at a time without the bounds mask, so
+    a padded window reads a few bytes past its end. The values are masked out, but macOS ends large blocks on a page
+    boundary: a temporary of whole pages (8 x 540 x 512 = 135 x 16 KB) segfaults when the next page is unmapped.
     XPG_COMPILE=0 disables, =1 forces. Callers keep input shapes fixed (pad batches): one compilation per run;
     dynamic=True for kernels called with varying batch sizes (one compilation per remaining static shape)."""
     mode = os.environ.get("XPG_COMPILE", "").strip().lower()
     if mode in ("0", "false", "no"):
         return fn
-    if mode not in ("1", "true", "yes") and (dev or _IMAGE_DEVICE).type not in devices:
+    kind = (dev or _IMAGE_DEVICE).type
+    if mode not in ("1", "true", "yes") and (kind not in devices or (kind == "cpu" and sys.platform == "darwin")):
         return fn
     state = {"f": None}
 

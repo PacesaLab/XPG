@@ -73,6 +73,47 @@ def test_toml_input_cli(tmp_path):
     assert not (tmp_path / "m" / "both").exists()          # no legacy-format merge output by default
 
 
+def test_cpu_option_spots(tmp_path):
+    """--cpu finds the spots of the uncompiled kernel, each run in its own process as a crash would take pytest with it.
+    8 frames of 540 x 512 are a whole number of 16 KB pages, the size that segfaulted when compiled for the macOS CPU."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    import xpg
+    spec = SimSpec(cell=(41.3, 52.7, 60.1, 90, 90, 90), space_group="P 21 21 21", nx=512, ny=540, orgx=255.3,
+                   orgy=270.6, distance=90.0, osc=0.5, nframes=60, dmin=2.2, gaps=False, mean_i0=8000.0, seed=13)
+    simulate(tmp_path, spec, verbose=False)
+    env = {k: v for k, v in os.environ.items() if k not in ("XPG_DEVICE", "XPG_COMPILE")}
+    spots = []
+    for name, extra in (("cpu", {}), ("eager", {"XPG_COMPILE": "0"})):
+        run = tmp_path / name
+        r = subprocess.run([sys.executable, "-c", "import sys; from xpg.cli import main; sys.exit(main(sys.argv[1:]))",
+                            str(tmp_path / "xpg.toml"), "-o", str(run), "--cpu", "--jobs", "DETECTOR", "BACKGROUND", "SPOTS"],
+                           cwd=Path(xpg.__file__).parents[1], env={**env, **extra}, capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+        assert ", cpu (" in (run / "xpg.log").read_text()  # the --jobs check imports the backend: --cpu has to be first
+        spots.append(np.loadtxt(run / "xpg_spots.txt"))
+    assert len(spots[0]) > 100 and np.array_equal(*spots)
+
+
+def test_compiled_kernels_by_platform(monkeypatch):
+    """Eager on the macOS CPU (backend.compiled says why); compiled on the Apple GPU and on the CPU elsewhere."""
+    import torch
+    from xpg import backend
+    def f(x):
+        return x
+    cpu, mps = torch.device("cpu"), torch.device("mps")
+    monkeypatch.delenv("XPG_COMPILE", raising=False)
+    monkeypatch.setattr(backend.sys, "platform", "darwin")
+    assert backend.compiled(f, dev=cpu) is f and backend.compiled(f, dev=mps) is not f
+    monkeypatch.setenv("XPG_COMPILE", "1")
+    assert backend.compiled(f, dev=cpu) is not f
+    monkeypatch.delenv("XPG_COMPILE")
+    monkeypatch.setattr(backend.sys, "platform", "linux")
+    assert backend.compiled(f, dev=cpu) is not f
+
+
 def test_gather_process_identical(tmp_path, monkeypatch):
     """XPG_GATHER_PROCESS=1 (frame loop in a forked process, shared-memory shoeboxes) integrates bit-identically."""
     import pickle
