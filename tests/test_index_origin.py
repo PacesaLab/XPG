@@ -68,6 +68,11 @@ def test_given_cell_does_not_decide_within_one_lattice():
     b = ("shifted", _res(18050, 1.0, _scaled(HEADER[1].exp.crystal.cell, 1.155 * v0 / v_hdr)))
     assert _choose_origin_candidate([a, b], known_cell=GIVEN) == ("shifted", None)
     assert _choose_origin_candidate([a, b]) == ("shifted", None)
+    # the same inside the window: only one of them within 5 % of the given cell, still one lattice
+    a = ("header", _res(18000, 2.0, _scaled(HEADER[1].exp.crystal.cell, 1.04 * v0 / v_hdr)))
+    b = ("shifted", _res(18050, 1.0, _scaled(HEADER[1].exp.crystal.cell, 1.06 * v0 / v_hdr)))
+    assert _choose_origin_candidate([a, b], known_cell=GIVEN) == ("shifted", None)
+    assert _choose_origin_candidate(list(reversed([a, b])), known_cell=GIVEN) == ("shifted", None)
 
 
 def test_given_cell_tolerates_a_few_percent():
