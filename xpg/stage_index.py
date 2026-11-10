@@ -109,7 +109,7 @@ class IndexStage:
             try:
                 res = index_spots(self.st.geom, self.st.spots, dmin_index=kw.get("dmin_index"),
                                   max_cell=kw.get("max_cell", p.max_cell), refine_flags=p.refine_idxref,
-                                  min_fraction=p.min_fraction_indexed, log=self.log,
+                                  min_fraction=p.min_fraction_indexed, log=self.log, known_cell=self._known_cell(),
                                   n_fft=kw.get("n_fft", 20000), max_cell_cap=kw.get("max_cell_cap", 400.0),
                                   basis_rank=kw.get("basis_rank", 0), search_extra_lattices=False,
                                   fft1d=kw.get("fft1d", False))
@@ -303,7 +303,7 @@ class IndexStage:
                 self.st.geom = g_seg
                 res = index_spots(g_seg, self.st.spots, dmin_index=None, max_cell=self.p.max_cell,
                                   refine_flags=self.p.refine_idxref, min_fraction=self.p.min_fraction_indexed,
-                                  log=self.log)
+                                  log=self.log, known_cell=self._known_cell())
         self.st.indexing = res
         self.st.exp = res.exp
         self.st.spots.hkl = res.hkl
@@ -551,6 +551,13 @@ class IndexStage:
                      f"({abs(round(np.linalg.det(c.P)))}x the volume)")
             return True
         return False
+
+    def _known_cell(self):
+        """(UNIT_CELL_CONSTANTS, SPACE_GROUP_NUMBER) when both are given, else None: lets indexing prefer, between
+        otherwise equal beam-centre candidates, the one whose cell volume matches."""
+        if self.p.space_group_number > 0 and self.p.unit_cell is not None:
+            return tuple(float(x) for x in self.p.unit_cell), int(self.p.space_group_number)
+        return None
 
     def _match_user_lattice(self, cands, tol_len=0.03, tol_ang=3.0):
         want = gemmi.find_spacegroup_by_number(self.p.space_group_number)

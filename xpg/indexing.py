@@ -535,6 +535,60 @@ def assign_indices(Astar, p0, tol=0.3):
     return hr.astype(int), ok
 
 
+def _cell_volume(cell):
+    a, b, c = (float(x) for x in cell[:3])
+    ca, cb, cg = (np.cos(np.radians(float(x))) for x in cell[3:6])
+    return a * b * c * float(np.sqrt(max(1.0 - ca * ca - cb * cb - cg * cg + 2.0 * ca * cb * cg, 0.0)))
+
+
+def _primitive_volume(cell, space_group_number):
+    """Volume per lattice point of a given conventional cell (UNIT_CELL_CONSTANTS + SPACE_GROUP_NUMBER): the
+    conventional volume over the lattice points per cell (P 1, A/B/C/I 2, F 4, R 3 on hexagonal axes, 1 on
+    rhombohedral axes). It does not depend on the basis, so it compares directly with a reduced cell's volume."""
+    sg = gemmi.find_spacegroup_by_number(int(space_group_number))
+    ct = sg.centring_type() if sg is not None else "P"
+    n = {"P": 1, "A": 2, "B": 2, "C": 2, "I": 2, "F": 4}.get(ct)
+    if ct == "R":
+        n = 3 if abs(float(cell[5]) - 120.0) < 1.0 else 1
+    return _cell_volume(cell) / (n or 1)
+
+
+def _choose_origin_candidate(cands, known_cell=None, count_tol=0.02, rmsd_ratio=1.2, vol_ratio=1.5, vol_tol=0.15):
+    """Pick between indexing at the header beam centre and at a shifted one: cands = [(label, IndexResult), ...].
+    Returns (label, reason or None).
+
+    Within count_tol of the best indexed count the counts do not decide: the count saturates at the acceptance
+    limit, and a lattice of k-fold volume contains every point of the true one, so it indexes the same spots plus,
+    by chance, a few more. Then, in this order:
+    1. when the two cells differ in volume by more than vol_ratio (different lattices: an index error changes the
+       volume by an integer factor k >= 2), a given cell (known_cell = (cell, space group number)) whose volume per
+       lattice point matches exactly one of them within vol_tol (wide enough for a few per cent error in distance or
+       wavelength, far below k >= 2);
+    2. for different lattices too: the smaller cell, unless its fit is clearly worse (rmsd more than rmsd_ratio above
+       the bigger cell's);
+    3. the clearly tighter fit (rmsd more than rmsd_ratio apart).
+    Otherwise the most spots indexed (then the smaller rmsd). Cells of one lattice (volumes within vol_ratio) go
+    straight to rule 3: their volume difference is noise."""
+    n_best = max(int(r.indexed.sum()) for _, r in cands)
+    close = [c for c in cands if int(c[1].indexed.sum()) >= (1.0 - count_tol) * n_best]
+    if len(close) == 2:
+        vols = [_cell_volume(r.exp.crystal.cell) for _, r in close]
+        if max(vols) > vol_ratio * min(vols):
+            if known_cell is not None:
+                v_known = _primitive_volume(*known_cell)
+                if np.isfinite(v_known) and v_known > 0:
+                    hit = [c for c, v in zip(close, vols) if abs(v / v_known - 1.0) <= vol_tol]
+                    if len(hit) == 1:
+                        return hit[0][0], f"its cell volume matches the given cell ({v_known:.0f} A^3 per lattice point)"
+            k = int(np.argmin(vols))
+            if close[k][1].rmsd_xy <= rmsd_ratio * close[1 - k][1].rmsd_xy:
+                return close[k][0], (f"smaller cell: {vols[k]:.0f} against {max(vols):.0f} A^3 with indexed counts "
+                                     f"within {100 * count_tol:.0f}%")
+        if max(r.rmsd_xy for _, r in close) > rmsd_ratio * min(r.rmsd_xy for _, r in close):
+            return min(close, key=lambda c: c[1].rmsd_xy)[0], None
+    return max(cands, key=lambda c: (int(c[1].indexed.sum()), -c[1].rmsd_xy))[0], None
+
+
 def index_spots(geom: Geometry, spots: SpotList, dmin_index=None, max_cell=None, refine_flags=None,
                 min_fraction=0.5, verbose=True, log=print, search_extra_lattices=True,
                 known_cell=None, known_system=None, max_err_xy=3.0, max_err_phi=2.0, beam_search=True,
@@ -619,14 +673,10 @@ def index_spots(geom: Geometry, spots: SpotList, dmin_index=None, max_cell=None,
                             f"{lab}: {int(r.indexed.sum())} spots indexed, rmsd {r.rmsd_xy:.2f} px, cell "
                             f"{np.array2string(r.exp.crystal.cell, precision=1)}" for lab, r in cands))
                     # the indexed count saturates at the acceptance limit (MAXIMUM_ERROR_OF_SPOT_POSITION): a wrong
-                    # index origin indexes nearly as many spots with a larger positional rmsd. Counts within 2%: the
-                    # clearly tighter fit (> 20%) wins.
-                    n_best = max(int(r.indexed.sum()) for _, r in cands)
-                    close = [c for c in cands if int(c[1].indexed.sum()) >= 0.98 * n_best]
-                    if len(close) == 2 and max(r.rmsd_xy for _, r in close) > 1.2 * min(r.rmsd_xy for _, r in close):
-                        lab, _ = min(close, key=lambda c: c[1].rmsd_xy)
-                    else:
-                        lab, _ = max(cands, key=lambda c: (int(c[1].indexed.sum()), -c[1].rmsd_xy))
+                    # index origin indexes nearly as many spots with a larger positional rmsd. Counts within 2%:
+                    lab, why = _choose_origin_candidate(cands, known_cell)
+                    if why and verbose:
+                        log(f"  INDEX: beam centre: {lab} kept ({why})")
                     g_best = g_sh if lab.startswith("shifted") else geom
                     if g_best is g_sh and verbose:
                         log(f"  INDEX: WARNING: header beam centre appears off by ({dxv:+.2f}, {dyv:+.2f}) px; "
