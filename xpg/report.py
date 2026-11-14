@@ -277,9 +277,14 @@ def _md_to_html(md: str) -> str:
            "font-variant-numeric:tabular-nums}td,th{border-bottom:1px solid #e5e5e5;padding:.25rem .6rem;text-align:right}"
            "td:first-child,th:first-child{text-align:left}tr:last-child td{font-weight:600}code{font-size:.85em}"
            "@media(prefers-color-scheme:dark){body{background:#161618;color:#e8e8ea}td,th{border-color:#333}"
-           "h2{border-color:#333}}")
+           "h2{border-color:#333}}"
+           ".logo{display:block;height:72px;margin:0 0 .4rem;padding:4px 6px;background:#fff;border-radius:8px}")
+    from .branding import logo_data_uri
+    uri = logo_data_uri("png")
+    logo = f"<img class='logo' src='{uri}' alt='XPG logo'>" if uri else ""
     return (f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
-            f"<title>XPG summary</title><style>{css}</style></head><body>" + "\n".join(out) + "</body></html>\n")
+            f"<title>XPG summary</title><style>{css}</style></head><body>" + logo + "\n".join(out)
+            + "</body></html>\n")
 
 
 def write_summary(pipe):

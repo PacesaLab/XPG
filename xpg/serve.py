@@ -157,13 +157,15 @@ def _run_dir(base, name):
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>XPG Monitor</title>
+<link rel="icon" type="image/png" href="/logo.png">
 <style>
 :root{--bg:#f6f6f3;--card:#fff;--ink:#1d1d1f;--mute:#6b6b70;--line:#e2e2de;--acc:#2f6fdd;--ok:#2e8b57;--warn:#b8740a;--bad:#c0392b;--fm:#7a4fd0;--pend:#c9c9c4}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#131315;--card:#1c1c20;--ink:#ececf0;--mute:#9a9aa3;--line:#2c2c31;--acc:#6ea0ff;--ok:#5cc28a;--warn:#e0a640;--bad:#ff6b5e;--fm:#b18cff;--pend:#45454b}}
 :root[data-theme="dark"]{--bg:#131315;--card:#1c1c20;--ink:#ececf0;--mute:#9a9aa3;--line:#2c2c31;--acc:#6ea0ff;--ok:#5cc28a;--warn:#e0a640;--bad:#ff6b5e;--fm:#b18cff;--pend:#45454b}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
 header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;gap:14px;align-items:baseline;flex-wrap:wrap}
-h1{font-size:18px;margin:0;letter-spacing:.02em}.sub{color:var(--mute);font-size:13px;word-break:break-all}
+h1{font-size:18px;margin:0;letter-spacing:.02em;display:flex;align-items:center;gap:8px}
+h1 img{height:38px;padding:2px 4px;background:#fff;border-radius:6px}.sub{color:var(--mute);font-size:13px;word-break:break-all}
 main{padding:16px 20px;display:grid;gap:16px;grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
 @media (max-width:820px){main{grid-template-columns:1fr;padding:16px}header{padding:14px 16px}}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;min-width:0}
@@ -194,7 +196,7 @@ textarea{width:100%;margin-top:8px;font:12px/1.4 ui-monospace,Menlo,monospace;ba
 select{font:inherit;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:6px}code{font:12px ui-monospace,Menlo,monospace;white-space:pre-wrap}
 a{color:var(--acc)}.muted{color:var(--mute)}button{font:inherit;background:none;border:1px solid var(--line);color:var(--ink);border-radius:6px;padding:2px 8px;cursor:pointer}
 </style></head><body>
-<header><h1>XPG</h1><span class="sub" id="what">waiting for events…</span><span class="sub" id="status"></span>
+<header><h1><img src="/logo.svg" alt="XPG logo">XPG</h1><span class="sub" id="what">waiting for events…</span><span class="sub" id="status"></span>
 <span class="sub" id="which"></span><span style="margin-left:auto" class="sub"><a id="report" href="/report" target="_blank" style="display:none">summary report</a></span></header>
 <main>
 <section class="card wide"><h2>Pipeline</h2><div class="track" id="track"></div></section>
@@ -369,6 +371,13 @@ def make_handler(run_dir: Path):
             qs = parse_qs(u.query)
             if u.path == "/":
                 return self._send(200, PAGE, "text/html; charset=utf-8")
+            if u.path in ("/logo.svg", "/logo.png"):
+                from .branding import logo_bytes
+                kind = u.path[-3:]
+                b = logo_bytes(kind)
+                if b:
+                    return self._send(200, b, "image/svg+xml" if kind == "svg" else "image/png")
+                return self._send(404, "not found", "text/plain")
             if u.path == "/api/runs":
                 return self._send(200, json.dumps({"runs": list_runs(run_dir), "stages": rerun_stages(run_dir)},
                                                   default=float), "application/json")

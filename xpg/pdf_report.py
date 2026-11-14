@@ -206,6 +206,26 @@ def _limit_label(S):
             if S.get("cc_half_fit") else "Resolution (CC½ = 0.3)")
 
 
+def _logo_badge(fig, hb):
+    """The logo on a white badge at the left of the header band; returns the width it takes (0 without the asset)."""
+    from .branding import LOGO_PNG
+    try:
+        import matplotlib.image as mpimg
+        logo = mpimg.imread(LOGO_PNG)
+    except (OSError, ValueError, ImportError):
+        return 0.0
+    from matplotlib.patches import FancyBboxPatch
+    hb.add_patch(FancyBboxPatch((0.012, 0.1), 0.088, 0.8, boxstyle="round,pad=0,rounding_size=0.12",
+                                transform=hb.transAxes, facecolor="white", edgecolor="none",
+                                mutation_aspect=1 / 14.2))
+    bb = hb.get_position()
+    ax = fig.add_axes([bb.x0 + 0.016 * bb.width, bb.y0 + 0.14 * bb.height, 0.080 * bb.width, 0.72 * bb.height])
+    ax.imshow(logo, interpolation="lanczos")
+    ax.set_axis_off()
+    ax.set_aspect("equal", adjustable="box")
+    return 0.075
+
+
 def _page1(pdf, D, img):
     import matplotlib.pyplot as plt
     S, run = D["summary"], D["run"]
@@ -216,8 +236,9 @@ def _page1(pdf, D, img):
     hb.set_axis_off()
     hb.add_patch(plt.Rectangle((0, 0), 1, 1, color="#184f95", transform=hb.transAxes))
     name = Path(run.get("template", "") or str(D["dir"])).name
-    hb.text(0.04, 0.58, "XPG processing summary", color="white", fontsize=14, fontweight="bold", transform=hb.transAxes)
-    hb.text(0.04, 0.2, f"{name}   ·   frames {'–'.join(map(str, run.get('frames', [])))}   ·   "
+    x0 = 0.04 + _logo_badge(fig, hb)
+    hb.text(x0, 0.58, "XPG processing summary", color="white", fontsize=14, fontweight="bold", transform=hb.transAxes)
+    hb.text(x0, 0.2, f"{name}   ·   frames {'–'.join(map(str, run.get('frames', [])))}   ·   "
             f"{time.strftime('%Y-%m-%d %H:%M')}", color="#cde2fb", fontsize=7.5, transform=hb.transAxes)
     from . import __version__
     hb.text(0.96, 0.58, f"XPG {__version__}", color="#cde2fb", fontsize=7.5, ha="right", transform=hb.transAxes)

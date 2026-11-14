@@ -1,3 +1,5 @@
+<p align="center"><img src="xpg/assets/XPG_logo.svg" alt="XPG logo" width="360"></p>
+
 # XPG — X-tal data Processing on GPU
 
 XPG takes your diffraction images and gives you merged, scaled data ready for refinement. It does spot finding,
